@@ -217,10 +217,16 @@ def main():
     encrypted_priv = encrypt_private_key(laptop_priv_pem, passphrase)
 
     # --- Local CA + leaf certificate, generated automatically -------------
-    print("\nEnter this laptop's LAN IP address (e.g. 192.168.1.42).")
-    print("Tip: set a static DHCP reservation for it on your router so this")
-    print("doesn't change later and break the cert.")
-    laptop_ip = input("Laptop LAN IP: ").strip()
+    print("\nWhat IP should the certificate be issued for?")
+    print("  - If you've set up Tailscale (recommended for cross-network use),")
+    print("    enter the laptop's Tailscale IP: run `tailscale ip -4` on the")
+    print("    laptop to get it (looks like 100.x.x.x).")
+    print("  - Otherwise, enter the laptop's LAN IP (e.g. 192.168.1.42) — this")
+    print("    will only work while phone and laptop share the same Wi-Fi.")
+    print("Tip: a Tailscale IP is stable and doesn't need a DHCP reservation.")
+    print("For a plain LAN IP, set a static DHCP reservation on your router so")
+    print("it doesn't change later and break the cert.")
+    laptop_ip = input("Laptop IP (Tailscale or LAN): ").strip()
 
     ca_key, ca_cert = generate_ca()
     leaf_key_pem, leaf_cert_pem = generate_leaf(ca_key, ca_cert, laptop_ip)
