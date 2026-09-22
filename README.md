@@ -13,7 +13,7 @@ the cost of more moving parts. Treat this as a solid, honest baseline:
 |---|---|
 | Captured challenge/response replayed later | Nonces are single-use, expire in 10s |
 | Network eavesdropper on your Wi-Fi | Mandatory TLS 1.2+, listener **refuses to start** without a cert |
-| Fake access point / MITM | Phone pins the laptop's cert fingerprint *and* verifies a signature from the laptop's own key — two independent checks |
+| Fake access point / MITM | Phone trusts a laptop-controlled local CA (verified via real TLS handshake) *and* verifies a signature from the laptop's own key — two independent checks |
 | Stolen laptop disk / another local user reads your config | Unlock private key is encrypted at rest with a passphrase (scrypt-derived key); the passphrase is never stored |
 | Brute-force attempts on the listener | Rate limiting (5 fails / 60s triggers cooldown) |
 | A bug causing "fail open" | Every error path (timeout, bad signature, malformed JSON, unexpected exception) returns rejection |
@@ -53,15 +53,42 @@ This will:
 Everything it writes lives in `~/.config/remote-unlock/`, permissions
 `600`/`700`, owner-only.
 
-### 3. Set up the systemd service, hardened
+### 3. (Optional but recommended) Set up Tailscale for cross-network unlock
+Without this, unlock only works when phone and laptop share the same
+Wi-Fi. Tailscale gives both devices a private, stable IP reachable over an
+encrypted WireGuard tunnel from anywhere — no port forwarding, nothing
+exposed to the public internet.
+
+```bash
+# Laptop (Linux):
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+tailscale ip -4    # note this — you'll enter it in pair.py
+```
+On the phone, install the Tailscale app from the App Store / Play Store
+and sign in with the same account. That's it — no further app code is
+needed, this is purely a network-layer tunnel underneath the same
+listener/app you already have.
+
+When you ran `pair.py` in step 2, you should have entered this Tailscale
+IP (not your LAN IP) when it asked. If you already paired with a LAN IP
+and want to switch, just re-run `pair.py` — it's not a destructive step
+for anything except the certs, which regenerate anyway.
+
+### 4. Set up the systemd service, hardened
 ```ini
 # ~/.config/systemd/user/remote-unlock.service
 [Unit]
 Description=Remote unlock listener
+# If using Tailscale, wait for it to be up before binding to its IP —
+# otherwise the bind in step 3 below will fail on every boot.
+After=tailscaled.service network-online.target
+Wants=tailscaled.service network-online.target
 
 [Service]
 ExecStart=/usr/bin/python3 %h/remote-unlock/listener.py
 Restart=on-failure
+RestartSec=5
 
 # Defense in depth: even though the process already avoids touching your
 # files, these flags make the OS enforce it too.
@@ -86,19 +113,32 @@ systemctl --user enable --now remote-unlock.service
 `python3 listener.py` in a terminal you keep open — it'll prompt for the
 passphrase directly. Less convenient, fewer moving parts.)
 
-### 4. Scope the firewall to your home network only
-Don't leave port 8765 open to the whole internet. If you're on a typical
-home router (no port forwarding needed — phone and laptop are on the same
-LAN), just confirm you haven't forwarded it:
+Note: `listener.py` now binds directly to the specific IP the cert was
+issued for (Tailscale or LAN) instead of `0.0.0.0`. This means the service
+is literally unreachable on any interface other than the one you paired
+with — stronger than firewall rules alone, since there's no other
+interface to accidentally leave open.
+
+### 5. Scope the firewall (still worth doing, even with Tailscale)
+**If you're using Tailscale:** the bind-to-specific-IP change above already
+means nothing on your raw LAN or the public internet can reach the
+listener — only traffic arriving through the Tailscale interface can. You
+can optionally also restrict at the firewall level for defense in depth:
+```bash
+sudo ufw allow in on tailscale0 to any port 8765 proto tcp
+sudo ufw deny 8765
+```
+
+**If you're NOT using Tailscale** (LAN-only setup): don't leave port 8765
+open to the whole internet — confirm you haven't port-forwarded it, and
+optionally scope to your home subnet:
 ```bash
 sudo ufw allow from 192.168.0.0/16 to any port 8765 proto tcp
 sudo ufw deny 8765
 ```
-(adjust the subnet to match your actual home network range). This limits
-exposure to devices already on your Wi-Fi, on top of the TLS + signature
-auth that already protects the protocol itself.
+(adjust the subnet to match your actual home network range).
 
-### 5. Wire up PAM (Linux)
+### 6. Wire up PAM (Linux)
 Add this as an **additional** line — not a replacement for your password —
 in `/etc/pam.d/gdm-password` or `/etc/pam.d/sudo`:
 ```
@@ -111,12 +151,14 @@ one more path PAM considers, on top of whatever your normal auth stack
 already requires. If you deliberately want passwordless phone-only login,
 understand exactly what you're trading away before flipping that switch.
 
-### 6. Test before you rely on it
+### 7. Test before you rely on it
 Run `listener.py` in a terminal (not as a service yet) and try an unlock
-from your phone. Watch the terminal output. Only move to the systemd
-service and PAM wiring once you've confirmed success **and** rejection
-(try it with the phone's fingerprint prompt cancelled) both work as
-expected.
+from your phone — first on the same Wi-Fi, then (if using Tailscale) with
+your phone switched to cellular data entirely, to confirm cross-network
+unlock actually works before you depend on it. Watch the terminal output.
+Also confirm rejection works (cancel the phone's fingerprint prompt and
+verify the laptop reports a rejected attempt). Only move to the systemd
+service and PAM wiring once both paths are confirmed.
 
 ## Re-pairing / revocation
 If you lose the phone, suspect the passphrase leaked, or just want to
@@ -141,10 +183,12 @@ Scan the QR code with Expo Go (iOS/Android) to run it on your phone. No
 App Store submission needed — this is for your own device only.
 
 ### Pairing flow, in order
-1. On the laptop: `python3 pair.py`. When it asks for a LAN IP, give your
-   laptop's local network address (e.g. `192.168.1.42`) — ideally with a
-   static DHCP reservation set on your router so it doesn't change.
-2. `pair.py` writes `~/.config/remote-unlock/ca-cert.pem`. Transfer this
+1. Set up Tailscale first if you want cross-network unlock (see step 3 in
+   the laptop setup above) — you need the IP before pairing.
+2. On the laptop: `python3 pair.py`. When it asks for an IP, give the
+   Tailscale IP (`tailscale ip -4`) for cross-network use, or the plain
+   LAN IP (e.g. `192.168.1.42`) for same-Wi-Fi-only use.
+3. `pair.py` writes `~/.config/remote-unlock/ca-cert.pem`. Transfer this
    file to your phone (AirDrop, email — it's a public certificate, not a
    secret) and install it as a trusted certificate:
    - **iOS**: open the file, follow the profile install prompt in
@@ -153,15 +197,30 @@ App Store submission needed — this is for your own device only.
      requires this second step for custom CAs.
    - **Android**: **Settings > Security > Encryption & credentials >
      Install a certificate > CA certificate**.
-3. Open the app on your phone. On the pairing screen: generate a keypair
+4. Open the app on your phone. On the pairing screen: generate a keypair
    (this also confirms Face ID / fingerprint is set up — the app refuses
    to proceed without it), then paste the phone's printed public key into
    `pair.py` on the laptop when prompted.
-4. `pair.py` will then print the laptop's public key — paste that into
+5. `pair.py` will then print the laptop's public key — paste that into
    the app's pairing screen and save. Pairing is now complete on both
    sides.
-5. On the unlock screen, enter the laptop's LAN IP and tap "Unlock my
-   laptop" to test the full flow end to end.
+6. On the unlock screen, enter the laptop's IP (Tailscale or LAN, matching
+   what you gave `pair.py`) and tap "Unlock my laptop" to test the full
+   flow end to end. It's remembered after the first successful attempt.
+
+### Range and notifications
+- **Without Tailscale**: unlock only works while phone and laptop share
+  the same Wi-Fi (normal Wi-Fi range, ~30–50m indoors). Off that network,
+  the app just times out — there's nothing internet-facing to reach.
+- **With Tailscale**: unlock works from anywhere either device has
+  internet access — home, mobile data, another country. The tunnel
+  handles routing regardless of physical distance.
+- **Push alerts always work anywhere**, independent of the above, since
+  `notify.py` posts to ntfy.sh over the open internet. You'll only ever
+  get an alert for an attempt that actually reached the listener, though
+  — with Tailscale that includes attempts from anywhere; without it,
+  only attempts from your own Wi-Fi (since nothing else could reach the
+  listener to attempt in the first place).
 
 ### Why there's no certificate-pinning library in the app
 A hand-rolled "pin this cert" check in app code is easy to write in a way
