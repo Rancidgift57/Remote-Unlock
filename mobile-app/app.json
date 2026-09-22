@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "Laptop Unlock",
+    "slug": "laptop-unlock",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": false,
+      "infoPlistNSFaceIDUsageDescription": "Face ID confirms it's really you before unlocking your laptop.",
+      "bundleIdentifier": "com.yourname.laptopunlock"
+    },
+    "android": {
+      "package": "com.yourname.laptopunlock",
+      "permissions": ["USE_BIOMETRIC", "USE_FINGERPRINT"]
+    },
+    "plugins": [
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Confirm it's you before unlocking your laptop."
+        }
+      ]
+    ]
+  }
+}
