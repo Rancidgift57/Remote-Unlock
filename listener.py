@@ -271,11 +271,30 @@ async def main():
     async def _handler(ws):
         await handler(ws, service)
 
-    async with websockets.serve(
-        _handler, "0.0.0.0", service.port, ssl=ssl_context
-    ):
-        log.info("Listening on port %s (%s)", service.port, "wss" if ssl_context else "ws")
-        await asyncio.Future()  # run forever
+    # Bind to the SPECIFIC IP the cert was issued for (Tailscale or LAN),
+    # not 0.0.0.0. This means the listener is literally unreachable on any
+    # other interface — e.g. if you're on Tailscale, it's unreachable from
+    # your plain LAN at all, on top of whatever firewall rules you also
+    # have. Stronger than firewall-only scoping because there's no
+    # interface to accidentally leave open.
+    bind_ip = config.get("listener_ip", "0.0.0.0")
+
+    try:
+        async with websockets.serve(
+            _handler, bind_ip, service.port, ssl=ssl_context
+        ):
+            log.info(
+                "Listening on %s:%s (%s)",
+                bind_ip, service.port, "wss" if ssl_context else "ws",
+            )
+            await asyncio.Future()  # run forever
+    except OSError as e:
+        log.error(
+            "Could not bind to %s:%s (%s). If this is a Tailscale IP, is "
+            "Tailscale running? If it's a LAN IP, has it changed? Re-run "
+            "pair.py to reissue the cert for the current IP if so.",
+            bind_ip, service.port, e,
+        )
 
 
 if __name__ == "__main__":
