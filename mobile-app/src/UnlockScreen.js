@@ -1,19 +1,27 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { View, Text, TextInput, Button, StyleSheet, ActivityIndicator } from "react-native";
+import * as SecureStore from "expo-secure-store";
 
 import { attemptUnlock } from "./network";
 
 const DEFAULT_PORT = "8765";
+const HOST_KEY = "remote-unlock-last-host"; // not sensitive — just a convenience, no biometric gate
+const PORT_KEY = "remote-unlock-last-port";
 
 export default function UnlockScreen({ onRepair }) {
-  const [host, setHost] = useState(""); // laptop's LAN IP, same one pair.py asked for
+  const [host, setHost] = useState(""); // laptop's Tailscale or LAN IP, same one pair.py asked for
   const [port, setPort] = useState(DEFAULT_PORT);
   const [status, setStatus] = useState(null); // null | "working" | "success" | "fail"
   const [message, setMessage] = useState("");
 
+  useEffect(() => {
+    SecureStore.getItemAsync(HOST_KEY).then((v) => v && setHost(v));
+    SecureStore.getItemAsync(PORT_KEY).then((v) => v && setPort(v));
+  }, []);
+
   async function handleUnlock() {
     if (!host.trim()) {
-      setMessage("Enter your laptop's LAN IP first.");
+      setMessage("Enter your laptop's IP first (Tailscale IP works from anywhere).");
       setStatus("fail");
       return;
     }
@@ -23,6 +31,12 @@ export default function UnlockScreen({ onRepair }) {
       const ok = await attemptUnlock(host.trim(), parseInt(port, 10) || 8765);
       setStatus(ok ? "success" : "fail");
       setMessage(ok ? "Laptop unlocked." : "Laptop rejected the request.");
+      if (ok) {
+        // Only remember the host/port after a verified success, so a typo
+        // or a stale IP doesn't get silently persisted.
+        await SecureStore.setItemAsync(HOST_KEY, host.trim());
+        await SecureStore.setItemAsync(PORT_KEY, port.trim());
+      }
     } catch (e) {
       setStatus("fail");
       setMessage(e.message || "Something went wrong.");
@@ -33,12 +47,12 @@ export default function UnlockScreen({ onRepair }) {
     <View style={styles.container}>
       <Text style={styles.title}>Unlock Laptop</Text>
 
-      <Text style={styles.label}>Laptop IP</Text>
+      <Text style={styles.label}>Laptop IP (Tailscale or LAN)</Text>
       <TextInput
         style={styles.input}
         value={host}
         onChangeText={setHost}
-        placeholder="192.168.1.42"
+        placeholder="100.x.x.x or 192.168.x.x"
         keyboardType="numbers-and-punctuation"
         autoCapitalize="none"
         autoCorrect={false}
