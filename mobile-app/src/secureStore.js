@@ -42,11 +42,11 @@ export async function storePrivateKey(privateKeyPem, publicKeyPem) {
  * Returns null if the prompt fails, is cancelled, or the key doesn't
  * exist — callers MUST treat null as "do not proceed."
  */
-export async function getPrivateKeyWithBiometrics() {
+export async function getPrivateKeyWithBiometrics(reason = "Confirm it's you to unlock your laptop") {
   try {
     return await SecureStore.getItemAsync(KEY_NAME, {
       requireAuthentication: true,
-      authenticationPrompt: "Confirm it's you to unlock your laptop",
+      authenticationPrompt: reason,
     });
   } catch (e) {
     return null; // cancelled, failed, or not available
