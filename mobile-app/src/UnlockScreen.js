@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from "react";
-import { View, Text, TextInput, Button, StyleSheet, ActivityIndicator } from "react-native";
+import { View, Text, TextInput, Button, StyleSheet, ActivityIndicator, Alert } from "react-native";
 import * as SecureStore from "expo-secure-store";
 
-import { attemptUnlock } from "./network";
+import { attemptUnlock, attemptShutdown } from "./network";
 
 const DEFAULT_PORT = "8765";
 const HOST_KEY = "remote-unlock-last-host"; // not sensitive — just a convenience, no biometric gate
@@ -13,18 +13,24 @@ export default function UnlockScreen({ onRepair }) {
   const [port, setPort] = useState(DEFAULT_PORT);
   const [status, setStatus] = useState(null); // null | "working" | "success" | "fail"
   const [message, setMessage] = useState("");
+  const [shutdownBusy, setShutdownBusy] = useState(false);
 
   useEffect(() => {
     SecureStore.getItemAsync(HOST_KEY).then((v) => v && setHost(v));
     SecureStore.getItemAsync(PORT_KEY).then((v) => v && setPort(v));
   }, []);
 
-  async function handleUnlock() {
+  function requireHost() {
     if (!host.trim()) {
       setMessage("Enter your laptop's IP first (Tailscale IP works from anywhere).");
       setStatus("fail");
-      return;
+      return false;
     }
+    return true;
+  }
+
+  async function handleUnlock() {
+    if (!requireHost()) return;
     setStatus("working");
     setMessage("");
     try {
@@ -40,6 +46,44 @@ export default function UnlockScreen({ onRepair }) {
     } catch (e) {
       setStatus("fail");
       setMessage(e.message || "Something went wrong.");
+    }
+  }
+
+  function handleShutdownPress() {
+    if (!requireHost()) return;
+    // Explicit confirmation BEFORE anything touches the network or
+    // biometrics. This is a destructive, irreversible action — the app
+    // asks twice (this dialog, then the biometric prompt inside
+    // attemptShutdown) on purpose.
+    Alert.alert(
+      "Shut down laptop?",
+      "This immediately powers off your laptop. Use this if you're seeing " +
+        "an unlock attempt you didn't make and want to stop it cold, " +
+        "instead of approving it. This cannot be undone remotely.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Shut it down", style: "destructive", onPress: runShutdown },
+      ]
+    );
+  }
+
+  async function runShutdown() {
+    setShutdownBusy(true);
+    setStatus("working");
+    setMessage("");
+    try {
+      const ok = await attemptShutdown(host.trim(), parseInt(port, 10) || 8765);
+      setStatus(ok ? "success" : "fail");
+      setMessage(
+        ok
+          ? "Shutdown command sent — laptop is powering off."
+          : "Laptop rejected the shutdown command (or the feature is disabled there)."
+      );
+    } catch (e) {
+      setStatus("fail");
+      setMessage(e.message || "Something went wrong.");
+    } finally {
+      setShutdownBusy(false);
     }
   }
 
@@ -81,6 +125,18 @@ export default function UnlockScreen({ onRepair }) {
         </Text>
       ) : null}
 
+      <View style={styles.dangerZone}>
+        <Text style={styles.dangerLabel}>
+          Didn't request this? Shut the laptop down instead of unlocking it.
+        </Text>
+        <Button
+          title={shutdownBusy ? "Sending..." : "Shut down laptop"}
+          color="#c0392b"
+          onPress={handleShutdownPress}
+          disabled={shutdownBusy || status === "working"}
+        />
+      </View>
+
       <View style={styles.footer}>
         <Button title="Re-pair" onPress={onRepair} color="#888" />
       </View>
@@ -98,5 +154,10 @@ const styles = StyleSheet.create({
   buttonWrap: { marginTop: 30 },
   success: { color: "#1e8e3e", textAlign: "center", marginTop: 20, fontSize: 15 },
   fail: { color: "#c0392b", textAlign: "center", marginTop: 20, fontSize: 15 },
-  footer: { marginTop: 60, alignItems: "center" },
+  dangerZone: {
+    marginTop: 40, padding: 14, borderRadius: 8, borderWidth: 1,
+    borderColor: "#f5c6c6", backgroundColor: "#fdf2f2",
+  },
+  dangerLabel: { fontSize: 12, color: "#8a2b2b", marginBottom: 10, textAlign: "center" },
+  footer: { marginTop: 40, alignItems: "center" },
 });
