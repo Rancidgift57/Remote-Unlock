@@ -120,14 +120,16 @@ class UnlockService:
     def issue_challenge(self) -> dict:
         """Nonce + timestamp, signed by the LAPTOP's own key, so the phone
         can verify it's really talking to the paired laptop — independent
-        of TLS cert pinning, as a second, unrelated trust check."""
+        of TLS cert pinning, as a second, unrelated trust check. Bound to
+        the "challenge" action so this signature can't be confused with an
+        "unlock" or "shutdown" response signature."""
         nonce = os.urandom(16).hex()
         now = time.time()
         self._pending_nonces[nonce] = now
         self._pending_nonces = {
             n: t for n, t in self._pending_nonces.items() if now - t < NONCE_TTL
         }
-        message = f"{nonce}:{now}".encode()
+        message = f"challenge:{nonce}:{now}".encode()
         signature = self.laptop_private_key.sign(message, ec.ECDSA(hashes.SHA256()))
         return {"nonce": nonce, "timestamp": now, "signature": signature.hex()}
 
@@ -140,9 +142,17 @@ class UnlockService:
     def _record_failure(self):
         self._fail_times.append(time.time())
 
-    def verify(self, nonce: str, timestamp: float, signature_hex: str) -> bool:
-        """Fail-closed: any problem at all returns False."""
+    def verify(self, nonce: str, timestamp: float, signature_hex: str, action: str = "unlock") -> bool:
+        """Fail-closed: any problem at all returns False. `action` is bound
+        into the signed message (see crypto.js's signChallenge), so a
+        signature produced for "unlock" cannot verify as "shutdown" or
+        vice versa, even with the same nonce/timestamp/key."""
         try:
+            if action not in ("unlock", "shutdown"):
+                log.warning("Unknown action %r — rejecting", action)
+                self._record_failure()
+                return False
+
             if self._rate_limited():
                 log.warning("Rate limit active — rejecting attempt")
                 return False
@@ -169,7 +179,7 @@ class UnlockService:
                 self._record_failure()
                 return False
 
-            message = f"{nonce}:{timestamp}".encode()
+            message = f"{action}:{nonce}:{timestamp}".encode()
             signature = bytes.fromhex(signature_hex)
 
             self.phone_public_key.verify(
@@ -202,16 +212,37 @@ def signal_pam(success: bool):
         log.error("Could not signal PAM socket: %s", e)
 
 
-def send_alert(success: bool, ntfy_topic: str):
-    """Fire-and-forget push notification; failure here never blocks login."""
+def trigger_shutdown(shutdown_command: list):
+    """
+    Executes the configured shutdown command. Runs as your normal user —
+    on most desktop Linux distros, polkit grants an active local session
+    permission to power off without sudo (org.freedesktop.login1.power-off).
+    If yours doesn't, see README.md for the sudoers NOPASSWD fallback.
+
+    This function is only ever called after UnlockService.verify() has
+    already returned True for action="shutdown" — i.e. a fresh,
+    single-use, rate-limited, biometric-gated signature from the paired
+    phone. There is no other path to this function.
+    """
+    import subprocess
+    try:
+        log.warning("Executing remote shutdown command: %s", shutdown_command)
+        subprocess.run(shutdown_command, check=True, timeout=10)
+    except Exception as e:
+        log.error("Shutdown command failed: %s", e)
+
+
+def send_alert(kind: str, ntfy_topic: str):
+    """Fire-and-forget push notification; failure here never blocks login
+    or shutdown. `kind` selects the message — see notify.py."""
     try:
         import notify
-        notify.send_unlock_alert(success, ntfy_topic)
+        notify.send_alert(kind, ntfy_topic)
     except Exception as e:
         log.warning("Notification failed (non-fatal): %s", e)
 
 
-async def handler(websocket, service: UnlockService):
+async def handler(websocket, service: UnlockService, shutdown_enabled: bool, shutdown_command: list):
     peer = websocket.remote_address
     try:
         challenge = service.issue_challenge()
@@ -224,17 +255,44 @@ async def handler(websocket, service: UnlockService):
             await websocket.send(json.dumps({"type": "result", "ok": False}))
             return
 
+        action = msg.get("action", "unlock")
+        if action not in ("unlock", "shutdown"):
+            await websocket.send(json.dumps({"type": "result", "ok": False}))
+            log.warning("Rejected request from %s: unknown action %r", peer, action)
+            return
+
+        if action == "shutdown" and not shutdown_enabled:
+            await websocket.send(json.dumps({"type": "result", "ok": False}))
+            log.warning(
+                "Rejected shutdown request from %s: feature disabled in config", peer
+            )
+            send_alert("shutdown_rejected", service.ntfy_topic)
+            return
+
         ok = service.verify(
             nonce=msg["nonce"],
             timestamp=float(msg["timestamp"]),
             signature_hex=msg["signature"],
+            action=action,
         )
 
         await websocket.send(json.dumps({"type": "result", "ok": ok}))
-        log.info("Unlock attempt from %s: %s", peer, "SUCCESS" if ok else "REJECTED")
+        log.info(
+            "%s attempt from %s: %s", action.upper(), peer, "SUCCESS" if ok else "REJECTED"
+        )
 
-        signal_pam(ok)
-        send_alert(ok, service.ntfy_topic)
+        if action == "unlock":
+            signal_pam(ok)
+            send_alert("unlock_success" if ok else "unlock_failed", service.ntfy_topic)
+        elif action == "shutdown":
+            # Deliberately does NOT touch signal_pam/PAM at all — shutdown
+            # is a completely separate code path with its own explicit
+            # verification, not a side effect of the unlock flow.
+            if ok:
+                trigger_shutdown(shutdown_command)
+                send_alert("shutdown_triggered", service.ntfy_topic)
+            else:
+                send_alert("shutdown_rejected", service.ntfy_topic)
 
     except (asyncio.TimeoutError, KeyError, json.JSONDecodeError, ValueError) as e:
         log.warning("Malformed/late request from %s: %s", peer, e)
@@ -268,8 +326,18 @@ async def main():
     service = UnlockService(config, laptop_private_key_pem)
     ssl_context = build_ssl_context(config)
 
+    # Off by default — pair.py asks explicitly during setup, or you can
+    # opt in later by editing pairing.json directly. See README.md for the
+    # security tradeoffs before enabling.
+    shutdown_enabled = bool(config.get("shutdown_enabled", False))
+    shutdown_command = config.get("shutdown_command", ["systemctl", "poweroff"])
+    if shutdown_enabled:
+        log.info("Remote shutdown is ENABLED (command: %s)", shutdown_command)
+    else:
+        log.info("Remote shutdown is disabled (see README.md to enable)")
+
     async def _handler(ws):
-        await handler(ws, service)
+        await handler(ws, service, shutdown_enabled, shutdown_command)
 
     # Bind to the SPECIFIC IP the cert was issued for (Tailscale or LAN),
     # not 0.0.0.0. This means the listener is literally unreachable on any
