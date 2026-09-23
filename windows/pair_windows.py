@@ -158,6 +158,12 @@ def main():
     ntfy_topic = "remote-unlock-" + secrets.token_hex(16)
     print(f"--- ntfy.sh topic (subscribe to this in the ntfy app) ---\n{ntfy_topic}\n")
 
+    print("Enable remote shutdown from the phone?")
+    print("Adds a second button in the app: shut the laptop down instead of")
+    print("approving an unlock attempt you didn't make. Same signature/nonce/")
+    print("rate-limit protections as unlock, but destructive — off by default.")
+    shutdown_enabled = input("Enable remote shutdown? [y/N] ").strip().lower() == "y"
+
     phone_pub_pem = input("Paste the phone app's public key, then press Enter:\n")
 
     config = {
@@ -169,9 +175,16 @@ def main():
         "tls_cert_path": str(cert_path),
         "tls_key_path": str(key_path),
         "ntfy_topic": ntfy_topic,
+        "shutdown_enabled": shutdown_enabled,
+        "shutdown_command": ["shutdown", "/s", "/t", "0"],
     }
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
     print(f"\nSaved to {CONFIG_FILE}")
+    if shutdown_enabled:
+        print("Remote shutdown: ENABLED (command: shutdown /s /t 0)")
+    else:
+        print('Remote shutdown: disabled (set "shutdown_enabled": true in the')
+        print("config file to turn it on later)")
     print(
         "\nNext: run credential-provider\\install.ps1 as Administrator, then start "
         "listener_windows.py (see README-Windows.md)."
