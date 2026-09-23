@@ -254,6 +254,19 @@ def main():
 
     ntfy_topic = "unlock-" + secrets.token_urlsafe(24)
 
+    # --- Remote shutdown, opt-in ------------------------------------------
+    print("\nEnable remote shutdown from the phone?")
+    print("This adds a second button in the app: if you see an unlock")
+    print("attempt you didn't make, you can shut the laptop down instead of")
+    print("approving it. It uses the SAME signature/nonce/rate-limit")
+    print("protections as unlock — a biometric-gated, single-use, signed")
+    print("command — but it's a destructive, irreversible action, so it's")
+    print("off by default. You can change this later by editing")
+    print(f"  {CONFIG_FILE}")
+    print("and setting \"shutdown_enabled\" to true/false directly.")
+    shutdown_answer = input("Enable remote shutdown? [y/N] ").strip().lower()
+    shutdown_enabled = shutdown_answer == "y"
+
     config = {
         "laptop_private_key_encrypted": encrypted_priv,
         "laptop_public_key_pem": laptop_pub_pem,
@@ -263,6 +276,8 @@ def main():
         "tls_cert_path": str(LEAF_CERT_FILE),
         "tls_key_path": str(LEAF_KEY_FILE),
         "ntfy_topic": ntfy_topic,
+        "shutdown_enabled": shutdown_enabled,
+        "shutdown_command": ["systemctl", "poweroff"],
     }
 
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
@@ -282,6 +297,16 @@ def main():
     print(f"\n=== ntfy.sh topic (treat as secret) ===")
     print(ntfy_topic)
     print(f"Subscribe to it in the ntfy app so you receive unlock alerts.")
+    if shutdown_enabled:
+        print("\n=== Remote shutdown: ENABLED ===")
+        print("Check that `systemctl poweroff` works without a password for your")
+        print("user (most desktop distros allow this via polkit for an active")
+        print("local session). If it prompts for a password, see README.md for")
+        print("the sudoers NOPASSWD fallback.")
+    else:
+        print("\nRemote shutdown: disabled (default). Enable later by editing")
+        print(f"  {CONFIG_FILE}")
+        print('  and setting "shutdown_enabled": true')
     print("\nNext: follow README.md to enable the systemd service and wire up PAM.")
     print("The listener will ask for your passphrase each time it starts.")
 
