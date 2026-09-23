@@ -6,14 +6,17 @@
  * (a one-time OS-level step, done in Settings — see the pairing screen),
  * React Native's built-in WebSocket validates the server's certificate
  * chain against the OS trust store just like it would for any HTTPS site.
- * No custom pinning code is needed or used here — that's deliberate: a
- * hand-rolled pinning check that isn't backed by the OS's actual TLS
- * stack is easy to get wrong and easy to silently no-op.
+ * No custom pinning code is needed or used here.
  *
  * On top of that transport-level guarantee, every challenge is ALSO
  * verified at the application layer against the laptop's own signing key
  * (captured at pairing) before we ever touch biometrics — two independent
  * checks, not one.
+ *
+ * Two commands are supported: "unlock" and "shutdown". They are NOT
+ * interchangeable at the crypto level — see crypto.js's action-bound
+ * signing. A signature proving "the phone holder approved an unlock" can
+ * never be reinterpreted as "the phone holder approved a shutdown."
  */
 
 import { verifySignature, signChallenge } from "./crypto";
@@ -21,12 +24,7 @@ import { getPrivateKeyWithBiometrics, getLaptopPublicKey } from "./secureStore";
 
 const CONNECT_TIMEOUT_MS = 15000;
 
-/**
- * Attempts one unlock. Resolves to `true`/`false` (the laptop's verdict),
- * or rejects with an Error describing what went wrong (bad laptop
- * identity, biometric cancelled, network error, timeout).
- */
-export function attemptUnlock(laptopHost, laptopPort = 8765) {
+function runCommand(laptopHost, laptopPort, action, biometricPromptReason) {
   return new Promise(async (resolve, reject) => {
     const laptopPublicKeyPem = await getLaptopPublicKey();
     if (!laptopPublicKeyPem) {
@@ -46,10 +44,10 @@ export function attemptUnlock(laptopHost, laptopPort = 8765) {
     const ws = new WebSocket(`wss://${laptopHost}:${laptopPort}`);
 
     const timer = setTimeout(() => {
-      finish(reject, new Error("Timed out connecting to laptop. Is it on the same Wi-Fi?"));
+      finish(reject, new Error("Timed out connecting to laptop. Is it reachable?"));
     }, CONNECT_TIMEOUT_MS);
 
-    ws.onerror = (err) => {
+    ws.onerror = () => {
       finish(
         reject,
         new Error(
@@ -69,11 +67,11 @@ export function attemptUnlock(laptopHost, laptopPort = 8765) {
       }
 
       if (msg.type === "challenge") {
+        // The laptop's own signature is bound to the "challenge" action —
+        // distinct from "unlock"/"shutdown" so these three signature
+        // classes can never be confused with each other.
         const laptopVerified = verifySignature(
-          laptopPublicKeyPem,
-          msg.nonce,
-          msg.timestamp,
-          msg.signature
+          laptopPublicKeyPem, msg.nonce, msg.timestamp, msg.signature, "challenge"
         );
         if (!laptopVerified) {
           finish(reject, new Error(
@@ -82,17 +80,18 @@ export function attemptUnlock(laptopHost, laptopPort = 8765) {
           return;
         }
 
-        const privateKeyPem = await getPrivateKeyWithBiometrics();
+        const privateKeyPem = await getPrivateKeyWithBiometrics(biometricPromptReason);
         if (!privateKeyPem) {
           finish(reject, new Error("Biometric authentication failed or cancelled."));
           return;
         }
 
         const timestamp = Date.now() / 1000;
-        const signature = signChallenge(privateKeyPem, msg.nonce, timestamp);
+        const signature = signChallenge(privateKeyPem, msg.nonce, timestamp, action);
 
         ws.send(JSON.stringify({
           type: "response",
+          action,
           nonce: msg.nonce,
           timestamp,
           signature,
@@ -102,4 +101,25 @@ export function attemptUnlock(laptopHost, laptopPort = 8765) {
       }
     };
   });
+}
+
+/**
+ * Attempts one unlock. Resolves to `true`/`false` (the laptop's verdict),
+ * or rejects with an Error describing what went wrong.
+ */
+export function attemptUnlock(laptopHost, laptopPort = 8765) {
+  return runCommand(laptopHost, laptopPort, "unlock", "Confirm it's you to unlock your laptop");
+}
+
+/**
+ * Sends a signed shutdown command. Resolves to `true` if the laptop
+ * accepted and executed it, `false` if rejected (bad signature, replay,
+ * rate-limited, or the laptop has the shutdown feature disabled in its
+ * config). The UI layer is responsible for getting explicit user
+ * confirmation BEFORE calling this — this function itself still requires
+ * a fresh biometric prompt on top of that, since it's a destructive,
+ * irreversible action.
+ */
+export function attemptShutdown(laptopHost, laptopPort = 8765) {
+  return runCommand(laptopHost, laptopPort, "shutdown", "Confirm it's you to shut down your laptop");
 }
