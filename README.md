@@ -4,7 +4,12 @@
 
 Remote-Unlock is a small, self-hosted system that lets you approve a laptop login from your phone using Face ID / fingerprint, instead of (or alongside) typing a password. It's built around a few hard rules: no plaintext secrets on disk, no writes to your filesystem during normal operation, fail-closed on every error path, and every trust decision backed by real cryptography rather than a "looks secure" shortcut.
 
-It is a **second factor layered on top of your existing login** — not a replacement for disk encryption or a strong password.
+It supports **Linux** (via PAM) and **Windows** (via a native Credential Provider), and on either platform you choose one of two authentication models:
+
+- **Second factor** (Linux only, the original default): your password is *always* required — the phone is an additional check layered on top, never a replacement.
+- **Fingerprint-primary** (both platforms): phone success logs you in with *no password prompt at all*; phone failure or timeout falls back to a normal password prompt. Only one factor is ever actually required.
+
+If you want a guarantee that a password is always checked no matter what, stay on Linux's default `optional` mode. Windows can only run in fingerprint-primary mode — the reason why is explained in the [Windows setup guide](#windows-setup-guide).
 
 ---
 
@@ -13,8 +18,9 @@ It is a **second factor layered on top of your existing login** — not a replac
 - [How it works](#how-it-works)
 - [Repository layout](#repository-layout)
 - [Is it secure?](#is-it-secure)
+- [Choosing a mode](#choosing-a-mode)
 - [Prerequisites](#prerequisites)
-- [Setup guide](#setup-guide)
+- [Setup guide (Linux)](#setup-guide-linux)
   1. [Install dependencies](#1-install-dependencies)
   2. [Pair your phone and laptop](#2-pair-your-phone-and-laptop)
   3. [Set up Tailscale (optional, recommended)](#3-set-up-tailscale-optional-recommended)
@@ -22,6 +28,7 @@ It is a **second factor layered on top of your existing login** — not a replac
   5. [Scope the firewall](#5-scope-the-firewall)
   6. [Wire up PAM](#6-wire-up-pam)
   7. [Test before you rely on it](#7-test-before-you-rely-on-it)
+- [Windows setup guide](#windows-setup-guide)
 - [Mobile app setup](#mobile-app-setup)
 - [Re-pairing and revocation](#re-pairing-and-revocation)
 - [Troubleshooting](#troubleshooting)
@@ -36,8 +43,9 @@ It is a **second factor layered on top of your existing login** — not a replac
 1. Your phone opens a TLS (`wss://`) connection to a small Python listener running on your laptop.
 2. The laptop sends back a **challenge**: a random nonce, a timestamp, and its own signature over both (proving the laptop, not an impostor, issued the challenge).
 3. Your phone asks for Face ID / fingerprint, then signs the nonce with a private key that only exists inside its secure enclave.
-4. The laptop verifies that signature against the phone's public key (exchanged once, during pairing). If it's valid, unused, and issued within the last 10 seconds, the laptop signals success over a local Unix socket.
-5. A small PAM helper — invoked as an *additional* auth step, not a replacement — reads that signal and tells the OS login prompt to proceed.
+4. The laptop verifies that signature against the phone's public key (exchanged once, during pairing). If it's valid, unused, and issued within the last 10 seconds, the laptop signals success to the login screen.
+5. **On Linux**, a PAM helper reads that signal off a local Unix socket and exits `0`/`1`; PAM either treats this as one more optional check (second-factor mode) or lets a success skip the password prompt entirely (fingerprint-primary mode) — see [step 6](#6-wire-up-pam).
+   **On Windows**, a Credential Provider tile reads the signal off a named pipe and, on success, submits your Windows credential directly to LogonUI — see the [Windows setup guide](#windows-setup-guide) for why this platform only supports fingerprint-primary mode.
 6. A push notification fires either way, so you know about every unlock attempt in real time, successful or not.
 
 ```
@@ -54,28 +62,31 @@ It is a **second factor layered on top of your existing login** — not a replac
  │  Phone app   │ ───────────────────────────────────────────────▶ │  listener.py  │
  └──────────────┘                                                   │  verify()     │
                                                                       └───────┬───────┘
-                                                                              │ 5. Unix socket (/run, tmpfs)
+                                                                              │ 5a. Linux: Unix socket (/run, tmpfs)
+                                                                              │ 5b. Windows: named pipe
                                                                               ▼
-                                                          ┌────────────────────────────┐
-                                                          │ pam_unlock_helper.py        │
-                                                          │ (called by pam_exec.so)     │
-                                                          └────────────┬───────────────┘
-                                                                       │ exit 0 / exit 1
-                                                                       ▼
-                                                              OS login prompt (PAM)
+                                        ┌─────────────────────────────┐   ┌──────────────────────────────┐
+                                        │ pam_unlock_helper.py (Linux) │   │ Credential Provider (Windows) │
+                                        │ called by pam_exec.so        │   │ COM DLL, runs inside LogonUI   │
+                                        └────────────┬─────────────────┘   └──────────────┬────────────────┘
+                                                      │ exit 0 / exit 1                    │ submits credential or goes idle
+                                                      ▼                                     ▼
+                                          PAM auth stack (optional/sufficient)     LogonUI (tile alongside password tile)
 
-                                                          6. notify.py → ntfy.sh push alert
+                                                          6. notify.py → ntfy.sh push alert (both platforms)
 ```
 
 ## Repository layout
 
 | File / folder | Purpose |
 |---|---|
-| `pair.py` | One-time setup script. Generates the laptop's ECDSA keypair, a local self-signed CA + TLS leaf certificate, an `ntfy.sh` alert topic, and exchanges public keys with the phone. Writes everything to `~/.config/remote-unlock/`. |
-| `listener.py` | The background service. Listens for phone connections over `wss://`, issues challenges, verifies signed responses, rate-limits, and signals the result to PAM. This is what you run as a systemd service. |
-| `pam_unlock_helper.py` | Called by `pam_exec.so` during login. Waits (up to 15s) on a local Unix socket for `listener.py` to signal success or failure, then exits `0` or `1` accordingly. |
-| `notify.py` | Sends a push notification via [ntfy.sh](https://ntfy.sh) for every unlock attempt, successful or rejected. No account required. |
-| `mobile-app/` | An Expo (React Native) app: pairing screen + unlock screen. Uses `src/crypto.js` for ECDSA signing (cross-compatible with the laptop's Python implementation) and `src/secureStore.js` (via `expo-secure-store`) to keep the phone's private key behind biometric authentication. |
+| `pair.py` | Linux one-time setup script. Generates the laptop's ECDSA keypair, a local self-signed CA + TLS leaf certificate, an `ntfy.sh` alert topic, and exchanges public keys with the phone. Writes everything to `~/.config/remote-unlock/`. |
+| `listener.py` | Linux background service. Listens for phone connections over `wss://`, issues challenges, verifies signed responses, rate-limits, and signals the result to PAM. This is what you run as a systemd service. |
+| `pam_unlock_helper.py` | Called by `pam_exec.so` during Linux login. Waits (up to 15s) on a local Unix socket for `listener.py` to signal success or failure, then exits `0` or `1`. Unchanged regardless of which PAM mode you choose. |
+| `notify.py` | Sends a push notification via [ntfy.sh](https://ntfy.sh) for every unlock attempt, successful or rejected. No account required. Shared by both platforms. |
+| `mobile-app/` | An Expo (React Native) app: pairing screen + unlock screen. Uses `src/crypto.js` for ECDSA signing (cross-compatible with the laptop's Python implementation) and `src/secureStore.js` (via `expo-secure-store`) to keep the phone's private key behind biometric authentication. Shared by both platforms. |
+| `linux-fingerprint-primary/` | Scripts and docs for switching Linux from second-factor (`optional`) to fingerprint-primary (`sufficient`) mode, and back. See [Choosing a mode](#choosing-a-mode). |
+| `windows/` | The full Windows port: `pair_windows.py`, `listener_windows.py`, and `credential-provider/` (the native Credential Provider C++/COM source, CMake build, and install/uninstall scripts). See the [Windows setup guide](#windows-setup-guide). |
 | `README.md` | This guide. |
 
 ## Is it secure?
@@ -87,24 +98,42 @@ Reasonably — for what it is. There's no such thing as "most secure" in absolut
 | Captured challenge/response replayed later | Nonces are single-use and expire after 10 seconds |
 | Network eavesdropper on your Wi-Fi | Mandatory TLS 1.2+; the listener **refuses to start** without a certificate |
 | Fake access point / MITM | The phone trusts a laptop-controlled local CA (verified via a real TLS handshake) *and* independently verifies a signature from the laptop's own key — two unrelated checks |
-| Stolen laptop disk / another local user reads your config | The unlock private key is encrypted at rest with a passphrase (scrypt-derived key); the passphrase itself is never stored |
+| Stolen laptop disk / another local user reads your config | The unlock private key (and, on Windows, your Windows password) is encrypted at rest with a passphrase (scrypt-derived key); the passphrase itself is never stored |
 | Brute-force attempts against the listener | Rate limiting — 5 failed attempts within 60 seconds triggers a cooldown |
 | A bug causing "fail open" | Every error path (timeout, bad signature, malformed JSON, unexpected exception) is treated as a rejection |
-| A local process spoofing a fake "unlock" signal to PAM | A timing sanity check rejects any signal that arrives faster than a real network round-trip + biometric prompt could plausibly take |
+| A local process spoofing a fake "unlock" signal | A timing sanity check rejects any signal that arrives faster than a real network round-trip + biometric prompt could plausibly take |
 | Someone discovering your `ntfy.sh` alert channel | The topic name is a long, automatically-generated random string — never a guessable default |
 
-**What this does *not* protect against:** a fully compromised laptop OS (malware running as root can bypass PAM entirely, independent of this project), or a compromised/jailbroken phone with the key physically extracted from its secure enclave via a hardware exploit. Nothing at this software layer fixes either of those — that's what full-disk encryption (LUKS / FileVault) and keeping your phone's OS up to date are for, and you should have both regardless of whether you use this project.
+**What this does *not* protect against:** a fully compromised laptop OS (malware running as root/admin can bypass this entirely, independent of this project), or a compromised/jailbroken phone with the key physically extracted from its secure enclave via a hardware exploit. Nothing at this software layer fixes either of those — that's what full-disk encryption (LUKS / BitLocker / FileVault) and keeping your phone's OS up to date are for, and you should have both regardless of whether you use this project.
+
+**Additional risk if you use fingerprint-primary mode (Windows always, Linux optionally):** phone-key compromise becomes full account compromise on its own, since no password check runs when the phone succeeds. This isn't hidden in the fine print — see [Choosing a mode](#choosing-a-mode) before switching.
+
+## Choosing a mode
+
+| | Second factor (`optional`) | Fingerprint-primary (`sufficient` / Windows Credential Provider) |
+|---|---|---|
+| Available on | Linux only | Linux and Windows |
+| Password required on phone success? | Yes, always | No |
+| Password required on phone failure/timeout? | Yes | Yes — normal password prompt appears |
+| What a stolen/cloned phone key gets an attacker | Nothing on its own — still needs your password | Full login, no password needed |
+| Where it's configured | `/etc/pam.d/...`, `optional` keyword | `/etc/pam.d/...`, `sufficient` keyword (Linux) — or install the Windows Credential Provider |
+| Setup docs | [Wire up PAM, step 6](#6-wire-up-pam) | `linux-fingerprint-primary/README-fingerprint-primary.md` (Linux) / [Windows setup guide](#windows-setup-guide) |
+
+**Why Windows can't offer true second-factor mode:** PAM's `optional` keyword works because PAM's own password-checking module runs independently in the same stack regardless of what this project's module does. A Windows Credential Provider has no such stack to defer to — it must hand LogonUI a complete, working credential to finish a logon, with no "phone said yes, now let Windows' own password module finish the job" handoff available. So on Windows, a phone success necessarily *is* the whole login. Full detail is in the [Windows setup guide](#windows-setup-guide).
+
+No code changes are needed to switch Linux modes — `pam_unlock_helper.py` and `listener.py` are identical either way; only the PAM keyword changes. Use the scripts in `linux-fingerprint-primary/` to apply or revert this safely, with backups.
 
 ## Prerequisites
 
-- A Linux laptop (PAM-based login — GDM, sudo, etc.). `pair.py` and `listener.py` are Python 3; PAM integration as written targets Linux specifically.
-- Python 3.9+ and `pip`.
+- A Linux laptop (PAM-based login — GDM, sudo, etc.) and/or a Windows laptop (Windows 10/11).
+- Python 3.9+ and `pip`, on whichever platform(s) you're setting up.
 - A smartphone (iOS or Android) able to run an Expo Go app, with Face ID / fingerprint already configured.
 - [Node.js](https://nodejs.org/) and `npm` on a machine to build/run the Expo app (can be the same laptop).
-- Root/sudo access on the laptop, for the PAM and firewall steps only — the listener itself never runs as root.
-- Optional but recommended: a [Tailscale](https://tailscale.com/) account, if you want unlock to work from outside your home Wi-Fi.
+- **Linux:** root/sudo access, for the PAM and firewall steps only — the listener itself never runs as root.
+- **Windows:** Administrator access, for registering the Credential Provider; Visual Studio 2022 (Desktop development with C++ workload) and CMake, to build it.
+- Optional but recommended on either platform: a [Tailscale](https://tailscale.com/) account, if you want unlock to work from outside your home Wi-Fi.
 
-## Setup guide
+## Setup guide (Linux)
 
 ### 1. Install dependencies
 
@@ -211,13 +240,44 @@ sudo ufw deny 8765
 
 ### 6. Wire up PAM
 
-Add this as an **additional** line — not a replacement for your password — in `/etc/pam.d/gdm-password` or `/etc/pam.d/sudo`:
+Add this as an **additional** line in `/etc/pam.d/gdm-password` or `/etc/pam.d/sudo`, placed **before** the file's normal `pam_unix.so` password line:
 
 ```
 auth optional pam_exec.so /home/YOURUSER/remote-unlock/pam_unlock_helper.py
 ```
 
-**Use `optional`, not `sufficient`.** `sufficient` lets a success here skip your password entirely, which means a compromised phone key becomes a full account compromise with zero other checks. `optional` just adds phone-unlock as one more path PAM considers, on top of whatever your normal auth stack already requires. If you deliberately want passwordless phone-only login, make sure you understand exactly what you're trading away before flipping that switch.
+This is **second-factor mode**: `optional` means a phone success or failure never independently grants or denies login — your password is always checked regardless. This is the safe default and needs nothing else.
+
+**Want fingerprint-primary mode instead** (phone success skips the password prompt; phone failure/timeout falls through to a normal password prompt)? Change only the keyword:
+
+```
+auth sufficient pam_exec.so /home/YOURUSER/remote-unlock/pam_unlock_helper.py
+```
+
+No changes to `pam_unlock_helper.py` or `listener.py` are needed for this — their exit-code contract (`0` = phone approved, `1` = anything else) already means exactly what `sufficient` needs. Use the safety scripts instead of hand-editing, so you get a backup and a lockout-safe test procedure:
+
+```bash
+chmod +x linux-fingerprint-primary/*.sh
+
+# Apply to sudo first — safest place to test:
+sudo ./linux-fingerprint-primary/apply_fingerprint_primary.sh /etc/pam.d/sudo
+
+# Test in a SECOND terminal, without closing your current session:
+sudo -k; sudo true
+
+# Only once phone-success AND phone-failure-falls-back-to-password both
+# work, apply the same change to your display manager:
+sudo ./linux-fingerprint-primary/apply_fingerprint_primary.sh /etc/pam.d/gdm-password
+```
+
+To revert to second-factor mode at any time:
+
+```bash
+sudo ./linux-fingerprint-primary/revert_fingerprint_primary.sh /etc/pam.d/sudo
+sudo ./linux-fingerprint-primary/revert_fingerprint_primary.sh /etc/pam.d/gdm-password
+```
+
+**Whichever mode you pick, never use `requisite`** — that would let a phone *failure* immediately deny login with no password fallback at all, which neither mode here is meant to do. Full tradeoffs and PAM-ordering rules are in `linux-fingerprint-primary/README-fingerprint-primary.md`.
 
 ### 7. Test before you rely on it
 
@@ -230,9 +290,79 @@ Watch the terminal output. Also confirm rejection works — cancel the phone's f
 
 Only move to the systemd service and PAM wiring (steps 4 and 6) once both the success and rejection paths are confirmed working.
 
+## Windows setup guide
+
+Windows has no PAM. The equivalent hook is a **Credential Provider** — a native COM DLL, registered with Windows, that adds a tile to the lock and login screen *alongside*, never replacing, the built-in password tile.
+
+**This is fingerprint-primary mode only** — see [Choosing a mode](#choosing-a-mode) for why a true always-require-password second factor isn't achievable with Windows' Credential Provider architecture. Concretely: a phone success submits your Windows password (captured once at pairing, encrypted at rest, decrypted only in memory) directly to LogonUI; a phone failure or timeout leaves the tile idle and you use the untouched password tile right next to it.
+
+### 1. Install Python dependencies
+
+```powershell
+pip install cryptography websockets pywin32
+```
+
+### 2. Pair your phone and this laptop
+
+```powershell
+python windows\pair_windows.py
+```
+
+Same flow as Linux `pair.py`, plus one extra prompt for your Windows account password (needed for the reason above). Everything lands in `%LOCALAPPDATA%\remote-unlock\pairing.json`, ACLed to your account + SYSTEM only.
+
+### 3. Build the Credential Provider
+
+Requires Visual Studio 2022 (Desktop development with C++ workload) and CMake.
+
+```powershell
+cd windows\credential-provider
+cmake -B build -A x64
+cmake --build build --config Release
+```
+
+### 4. Register it (as Administrator)
+
+```powershell
+.\install.ps1
+```
+
+**Test on the lock screen first** (`Win+L`), not by signing out or rebooting, so you can immediately `Ctrl+Alt+Del` back to the password tile if anything's off. Only rely on it for real sign-outs/reboots once a lock-screen test has actually succeeded end to end.
+
+### 5. Run the listener
+
+```powershell
+python windows\listener_windows.py
+```
+
+For it to survive logoff/lock (which is exactly when you need it), set it up in Task Scheduler:
+- Trigger: **At log on** (your user)
+- Action: `python.exe windows\listener_windows.py`
+- Check **"Run whether user is logged on or not"** if you want it alive through a full lock screen, not just a session-switch
+
+The same Tailscale advice from [step 3 of the Linux guide](#3-set-up-tailscale-optional-recommended) applies unchanged — nothing about that part is Windows-specific.
+
+### Uninstalling / falling back to password-only
+
+```powershell
+cd windows\credential-provider
+.\uninstall.ps1
+```
+
+This is the safety valve. It only removes the tile registration — it never touches your actual Windows account password, and you're back to exactly stock Windows login.
+
+### Hardening notes (read before relying on this)
+
+- **The named pipe currently uses a default security descriptor.** Before trusting this beyond testing, give `CreateNamedPipeW` in `windows/credential-provider/RemoteUnlockCredential.cpp` an explicit `SECURITY_ATTRIBUTES` / `SECURITY_DESCRIPTOR` restricting connections to your account SID + `SYSTEM` (`S-1-5-18`) only — otherwise another local account could in principle attempt to connect to the pipe while it's open.
+- **Local admin can still read the encrypted password file** if they also compromise your passphrase — same caveat the Linux private key has.
+- **A fully compromised OS (malware with admin) bypasses this exactly like it bypasses PAM** — never in scope for either platform.
+- The DLL is unsigned. Production use means getting an Authenticode certificate and signing it; understand SmartScreen/Defender warnings before dismissing them, rather than disabling them blindly.
+- Not yet tested against a live Windows lock screen end to end — confirm `CredPackAuthenticationBufferW`'s `COMPUTER\user` format matches your setup (switch `GetLocalComputerNameW()` in `RemoteUnlockCredential.cpp` to your domain name if this machine is domain-joined), and complete the lock-screen dry run in step 4 before trusting it further.
+
+Full detail: `windows/README-Windows.md`.
+
 ## Mobile app setup
 
-The `mobile-app/` folder is a working Expo app with a pairing screen and an unlock screen, wired to real cryptography (`src/crypto.js`, tested cross-compatible with the laptop's Python signing/verification) and biometric-gated key storage (`src/secureStore.js`, via `expo-secure-store`'s `requireAuthentication`).
+The `mobile-app/` folder is a working Expo app with a pairing screen and an unlock screen, wired to real cryptography (`src/crypto.js`, tested cross-compatible with the laptop's Python signing/verification) and biometric-gated key storage (`src/secureStore.js`, via `expo-secure-store`'s `requireAuthentication`). It's shared unchanged between the Linux and Windows setups.
 
 ### Install and run
 
@@ -247,13 +377,13 @@ Scan the QR code with the Expo Go app (iOS or Android) to run it on your phone. 
 ### Pairing flow, in order
 
 1. If you want cross-network unlock, set up Tailscale first (see [step 3](#3-set-up-tailscale-optional-recommended) above) — you'll need the IP before pairing.
-2. On the laptop, run `python3 pair.py`. When it asks for an IP, give it the Tailscale IP (`tailscale ip -4`) for cross-network use, or the plain LAN IP (e.g. `192.168.1.42`) for same-Wi-Fi-only use.
-3. `pair.py` writes `~/.config/remote-unlock/ca-cert.pem`. Transfer this file to your phone (AirDrop, email — it's a public certificate, not a secret) and install it as a trusted certificate:
+2. On the laptop, run `python3 pair.py` (Linux) or `python windows\pair_windows.py` (Windows). When it asks for an IP, give it the Tailscale IP (`tailscale ip -4`) for cross-network use, or the plain LAN IP (e.g. `192.168.1.42`) for same-Wi-Fi-only use.
+3. Pairing writes a CA certificate (`~/.config/remote-unlock/ca-cert.pem` on Linux, `%LOCALAPPDATA%\remote-unlock\cert.pem` on Windows). Transfer this file to your phone (AirDrop, email — it's a public certificate, not a secret) and install it as a trusted certificate:
    - **iOS:** open the file and follow the profile install prompt in Settings, then separately go to **Settings → General → About → Certificate Trust Settings** and enable full trust for it. iOS requires this second step for custom CAs.
    - **Android:** **Settings → Security → Encryption & credentials → Install a certificate → CA certificate.**
-4. Open the app on your phone. On the pairing screen, generate a keypair — this also confirms Face ID / fingerprint is set up, since the app refuses to proceed without it — then paste the phone's printed public key into `pair.py` on the laptop when prompted.
-5. `pair.py` then prints the laptop's public key. Paste that into the app's pairing screen and save. Pairing is now complete on both sides.
-6. On the unlock screen, enter the laptop's IP (Tailscale or LAN — matching what you gave `pair.py`) and tap "Unlock my laptop" to test the full flow end to end. It's remembered after the first successful attempt.
+4. Open the app on your phone. On the pairing screen, generate a keypair — this also confirms Face ID / fingerprint is set up, since the app refuses to proceed without it — then paste the phone's printed public key into the laptop's pairing script when prompted.
+5. The pairing script then prints the laptop's public key. Paste that into the app's pairing screen and save. Pairing is now complete on both sides.
+6. On the unlock screen, enter the laptop's IP (Tailscale or LAN — matching what you gave the pairing script) and tap "Unlock my laptop" to test the full flow end to end. It's remembered after the first successful attempt.
 
 ### Range and notifications
 
@@ -267,288 +397,64 @@ A hand-rolled "pin this cert" check in app code is easy to write in a way that l
 
 ## Re-pairing and revocation
 
-If you lose the phone, suspect the passphrase leaked, or just want to rotate keys:
+**Linux:** if you lose the phone, suspect the passphrase leaked, or just want to rotate keys:
 
 ```bash
 rm -rf ~/.config/remote-unlock/
 python3 pair.py
 ```
 
-There's no separate "revoke" step needed — the old keys simply stop being accepted once the config that referenced them is gone.
+**Windows:** the equivalent is:
+
+```powershell
+Remove-Item -Recurse -Force $env:LOCALAPPDATA\remote-unlock\
+python windows\pair_windows.py
+```
+
+There's no separate "revoke" step needed on either platform — the old keys (and, on Windows, the old stored password) simply stop being accepted once the config that referenced them is gone.
 
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `listener.py` exits immediately with "No TLS certificate configured" | `pair.py` hasn't been run yet, or `pairing.json` is missing/corrupted. Re-run `pair.py`. |
-| `listener.py` fails to bind on startup | The IP it's trying to bind to (Tailscale or LAN) isn't currently assigned to the machine. If using Tailscale, confirm `tailscaled` is running (`sudo tailscale status`). If your LAN IP changed, set a static DHCP reservation or re-run `pair.py` to reissue the cert for the new IP. |
-| Phone times out trying to connect | Confirm phone and laptop are on the same Wi-Fi (non-Tailscale setup) or both connected to your tailnet (Tailscale setup). Check the firewall rule from [step 5](#5-scope-the-firewall) allows port 8765. |
+| `listener.py` / `listener_windows.py` exits immediately with "No TLS certificate configured" | Pairing hasn't been run yet, or `pairing.json` is missing/corrupted. Re-run `pair.py` (Linux) or `pair_windows.py` (Windows). |
+| Listener fails to bind on startup | The IP it's trying to bind to (Tailscale or LAN) isn't currently assigned to the machine. If using Tailscale, confirm `tailscaled` is running (`sudo tailscale status` / Tailscale app status on Windows). If your LAN IP changed, set a static DHCP reservation or re-run pairing to reissue the cert for the new IP. |
+| Phone times out trying to connect | Confirm phone and laptop are on the same Wi-Fi (non-Tailscale setup) or both connected to your tailnet (Tailscale setup). On Linux, check the firewall rule from [step 5](#5-scope-the-firewall) allows port 8765. |
 | Phone connects but the unlock is always rejected | Re-check that the public keys pasted during pairing match exactly (no truncated lines). Also confirm your phone's clock is accurate — signatures include a timestamp and are rejected outside a small allowed skew. |
-| Login prompt just times out without ever asking for the phone | Confirm the `pam_exec.so` line was added to the correct file (`gdm-password`, `sudo`, etc.) and that the path to `pam_unlock_helper.py` is correct and executable. |
-| No push notification arrives | Confirm you're subscribed to the exact `ntfy_topic` printed by `pair.py`, in the ntfy app. Notification failures never block login — check `listener.py`'s logs for a "Notification failed" warning. |
-| Passphrase prompt appears every time you `sudo` | That's expected if you're running `listener.py` manually in a terminal each boot — it decrypts the private key into memory once at service startup, not on every unlock attempt. Move to the systemd service in [step 4](#4-install-the-systemd-service) so it only asks once per boot. |
-
-
-# Remote-Unlock for Windows
-
-A Windows port of [Remote-Unlock](https://github.com/Rancidgift57/Remote-Unlock).
-Same phone, same crypto, same pairing model — the login hook is rebuilt
-for Windows because Windows has no PAM.
-
-## How this differs from the Linux/PAM version
-
-| | Linux (original) | Windows (this) |
-|---|---|---|
-| Login hook | `pam_exec.so` line in `/etc/pam.d/*` | A native **Credential Provider** COM DLL registered with Windows |
-| Signal to the login screen | Unix domain socket in `/run` (tmpfs) | Named pipe (`\\.\pipe\remote-unlock-signal`) |
-| What gets signaled | pass/fail byte only — your real password is handled separately by PAM's own stack | pass/fail **plus** your Windows password, because Windows has no equivalent stack to hand off to |
-| Fallback to password | `optional` (not `sufficient`) in the PAM stack | The built-in Windows password tile is simply never hidden — both tiles sit side by side |
-
-**The behavior you asked for — fingerprint as the lock, password as the
-fallback if fingerprint fails — is what this already does, by default,
-with no extra flag to set.** The Credential Provider adds one tile.
-It never disables, hides, or overrides Windows' own password tile. If
-your phone confirms, our tile submits your credential and you're in.
-If it fails or times out, our tile just goes idle with a status message
-— you click the password tile right next to it, same screen, no reboot,
-no config change.
-
-## Why your Windows password has to be stored (encrypted) at all
-
-This is the one real architectural difference from Linux worth
-understanding before you install it, not after:
-
-PAM's `optional` keyword works because PAM's *own* password-checking
-module runs independently, in the same stack, regardless of what our
-module does. Windows Credential Providers don't sit inside a stack like
-that — each one must independently hand LogonUI a **complete, working
-credential** to finish a logon. There is no "phone said yes, now let
-Windows' password module finish the job" handoff available to a
-third-party provider.
-
-So the only two honest options are:
-1. Store your Windows password, encrypted at rest, unlocked only by the
-   same passphrase that already protects your ECDSA private key
-   (this build), or
-2. Don't build a real unlock path at all, and just have the tile do
-   nothing after "success" (not what you asked for).
-
-This is the same trust model Windows Hello / USB fingerprint readers use
-under the hood — they also keep a protected credential that biometric
-success releases. `pair_windows.py` encrypts it with scrypt + Fernet,
-exactly like the Linux build's private-key passphrase, and it's
-decrypted only in `listener_windows.py`'s own memory, for the few
-milliseconds it takes to relay it down the pipe on a successful phone
-tap. It is never written to disk unencrypted.
-
-## Setup
-
-### 1. Install Python dependencies
-
-```powershell
-pip install cryptography websockets pywin32
-```
-
-### 2. Pair your phone and this laptop
-
-```powershell
-python pair_windows.py
-```
-
-Same flow as the Linux `pair.py`, plus one extra prompt for your Windows
-account password. Everything lands in
-`%LOCALAPPDATA%\remote-unlock\pairing.json`, ACLed to your account + SYSTEM.
-
-### 3. Build the Credential Provider
-
-Requires Visual Studio 2022 (Desktop development with C++ workload) and
-CMake.
-
-```powershell
-cd credential-provider
-cmake -B build -A x64
-cmake --build build --config Release
-```
-
-### 4. Register it (as Administrator)
-
-```powershell
-.\install.ps1
-```
-
-**Test on the lock screen first** (`Win+L`), not by signing out or
-rebooting, so you can immediately `Ctrl+Alt+Del` back to the password
-tile if anything's off. Only rely on it for real once a lock-screen test
-has actually succeeded end to end.
-
-### 5. Run the listener
-
-```powershell
-python listener_windows.py
-```
-
-For it to survive logoff/lock (which is exactly when you need it),
-set it up in Task Scheduler:
-- Trigger: **At log on** (your user)
-- Action: `python.exe listener_windows.py`
-- Check **"Run whether user is logged on or not"** if you want it alive
-  through a full lock screen, not just a session-switch
-
-Same Tailscale-for-cross-network-unlock advice from the main README
-applies unchanged — nothing about that part is Windows-specific.
-
-## Uninstalling / falling back to password-only
-
-```powershell
-cd credential-provider
-.\uninstall.ps1
-```
-
-This is the safety valve. It only removes the tile registration — it
-never touches your actual Windows account password, and you're back to
-exactly stock Windows login.
-
-## Hardening notes (read before relying on this)
-
-- **The named pipe currently uses a default security descriptor.**
-  Before trusting this beyond testing, give `CreateNamedPipeW` in
-  `RemoteUnlockCredential.cpp` an explicit `SECURITY_ATTRIBUTES` /
-  `SECURITY_DESCRIPTOR` restricting connections to your account SID +
-  `SYSTEM` (`S-1-5-18`) only — otherwise another local account could in
-  principle attempt to connect to the pipe while it's open. The
-  `_pipe_security_attributes`-style ACL shown in the Python listener is
-  the pattern to mirror in C++; flagged here rather than silently shipped
-  as "done," matching how the original README treats every mitigation as
-  a named, specific one rather than a blanket "secure" claim.
-- **Local admin can still read the DPAPI/Fernet-encrypted password file**
-  if they also compromise your passphrase — same caveat the Linux
-  version states for its private key.
-- **A fully compromised OS (malware with admin) bypasses this exactly
-  like it bypasses PAM** — this was never in scope for either platform.
-- Treat the Credential Provider like any other native Windows component
-  that runs during logon: keep the source auditable, and don't disable
-  Windows Defender / SmartScreen warnings about an unsigned, unfamiliar
-  DLL without understanding why they're appearing (this build is
-  unsigned; production use would mean getting an Authenticode
-  certificate and signing the DLL).
-
-## What's unfinished / needs your testing
-
-I can't compile or run this against a real Windows lock screen from here
-— I don't have a Windows environment in this session. Before relying on
-it:
-- Build it, and check for compile errors specific to your Windows SDK
-  version (COM interface signatures have shifted slightly across SDK
-  releases in the past).
-- Confirm `CredPackAuthenticationBufferW` accepts the `COMPUTER\user`
-  format for your setup — if this laptop is domain-joined rather than a
-  local account, change `GetLocalComputerNameW()` in
-  `RemoteUnlockCredential.cpp` to use your domain name instead.
-- Do the lock-screen dry run in step 4 above before trusting it on a
-  real sign-out or reboot.
-
-
-# Linux: switching from second factor to fingerprint-primary
-
-By default, the upstream project's `/etc/pam.d/...` line is:
-
-```
-auth optional pam_exec.so /home/YOURUSER/remote-unlock/pam_unlock_helper.py
-```
-
-`optional` = **true second factor**: your password is always required
-regardless of what the phone does; a phone success adds nothing on its
-own, a phone failure doesn't block you either (that's what "optional"
-means in PAM terms) — its only effect in this stack is a checkbox that
-can't independently deny or grant.
-
-To match the Windows Credential Provider behavior — **fingerprint is the
-lock, password is the fallback only if fingerprint fails** — change the
-keyword to `sufficient`:
-
-```
-auth sufficient pam_exec.so /home/YOURUSER/remote-unlock/pam_unlock_helper.py
-```
-
-## Why no Python changes are needed
-
-`pam_unlock_helper.py`'s contract was already written to support this:
-exit `0` only on a verified phone success, exit `1` on literally anything
-else (timeout, malformed signal, socket error — see its docstring). That
-is precisely what `sufficient` needs: success short-circuits the rest of
-the auth stack (you're in, no password prompt), failure falls through to
-the next module in the stack — normally `pam_unix.so`, your normal
-password check — which then prompts you as usual.
-
-`listener.py` needs no changes either — it already only signals `1`
-(success) after full nonce/signature/rate-limit verification, and `0`
-otherwise.
-
-## How to apply it
-
-```bash
-chmod +x apply_fingerprint_primary.sh revert_fingerprint_primary.sh
-
-# sudo prompts first (safest place to test):
-sudo ./apply_fingerprint_primary.sh /etc/pam.d/sudo
-
-# test in a SECOND terminal before touching anything else:
-sudo -k; sudo true
-
-# only once that works both ways (phone succeeds -> no password;
-# phone fails/cancelled -> normal password prompt appears), apply the
-# same change to your display manager's PAM file for the lock/login
-# screen, e.g.:
-sudo ./apply_fingerprint_primary.sh /etc/pam.d/gdm-password
-```
-
-To go back to true second-factor (password always required) at any time:
-
-```bash
-sudo ./revert_fingerprint_primary.sh /etc/pam.d/sudo
-sudo ./revert_fingerprint_primary.sh /etc/pam.d/gdm-password
-```
-
-## Ordering matters
-
-The `pam_exec.so` line must come **before** the distro's normal
-`pam_unix.so` password line in the same file. That's already the
-convention the upstream README's step 6 places it in — this change only
-swaps the keyword, not the line's position. If you've reordered the file
-yourself, put the fingerprint line back above the password line before
-applying `sufficient`, or a phone failure won't correctly fall through to
-a password prompt.
-
-## Same tradeoff as Windows, stated plainly
-
-This is a real reduction in security compared to the original
-second-factor design, not just a config tweak: **phone-key compromise
-now becomes full account compromise on its own**, with no password check
-in the loop when the phone succeeds. The upstream README already says
-this explicitly under step 6 ("if you deliberately want passwordless
-phone-only login, understand exactly what you're trading away") — this
-doc is just making that switch concrete and reversible, not arguing you
-into or out of it.
+| **(Linux)** Login prompt just times out without ever asking for the phone | Confirm the `pam_exec.so` line was added to the correct file (`gdm-password`, `sudo`, etc.), that it comes before the `pam_unix.so` line, and that the path to `pam_unlock_helper.py` is correct and executable. |
+| **(Linux)** Phone succeeds but you're still asked for your password | You're on second-factor (`optional`) mode — this is expected. Switch to `sufficient` via `linux-fingerprint-primary/apply_fingerprint_primary.sh` if you want phone success alone to be enough. |
+| **(Windows)** Tile shows "Timed out — use your password" | `listener_windows.py` isn't running, or isn't running under your own account (check Task Scheduler). The tile has nothing to connect to otherwise. |
+| **(Windows)** Tile doesn't appear on the lock screen at all | `install.ps1` wasn't run as Administrator, or `regsvr32` failed silently — re-run `regsvr32 %SystemRoot%\System32\RemoteUnlockCredentialProvider.dll` without `/s` to see the actual error. |
+| No push notification arrives | Confirm you're subscribed to the exact `ntfy_topic` printed during pairing, in the ntfy app. Notification failures never block login — check the listener's logs for a "Notification failed" warning. |
+| Passphrase prompt appears every time you `sudo` | That's expected if you're running the listener manually in a terminal each boot — it decrypts secrets into memory once at service startup, not on every unlock attempt. Move to the systemd service ([step 4](#4-install-the-systemd-service)) or Task Scheduler so it only asks once per boot. |
 
 ## FAQ
 
 **Does this replace my password?**
-No, by default it's wired in as `optional`, meaning it's an additional path, not a replacement. See the warning in [step 6](#6-wire-up-pam) if you want to change that.
+On Linux, only if you choose fingerprint-primary (`sufficient`) mode — by default it's wired in as `optional`, an additional path, not a replacement. On Windows, yes: a phone success submits your Windows password on your behalf, with no separate prompt — see [Choosing a mode](#choosing-a-mode) for why Windows can't offer the `optional` guarantee.
 
 **What happens if my phone is offline or dead?**
-Nothing breaks — your normal password login still works exactly as before. This is purely additive.
+Your normal password login still works exactly as before, on both platforms and in both modes — this is purely additive, never a lockout risk by itself.
 
 **Does anything get written to disk during normal unlock attempts?**
-No. `listener.py` reads `pairing.json` once at startup and otherwise only touches a Unix domain socket in `/run` (tmpfs, RAM-backed, wiped on reboot). The only files ever written are the one-time outputs of `pair.py`.
+No. The listener reads `pairing.json` once at startup and otherwise only touches a Unix domain socket in `/run` (Linux, tmpfs, RAM-backed) or a named pipe (Windows, not disk-backed at all). The only files ever written are the one-time outputs of pairing.
+
+**Can I run both Linux and Windows Credential Provider setups from one pairing?**
+No — pair separately per machine. Each device gets its own laptop keypair, TLS cert, and (on Windows) encrypted password, all stored locally to that machine.
+
+**Which mode should I actually pick?**
+If you want a hard guarantee that your password is always checked, use Linux with `optional` (the default). If your priority is speed/convenience and you're comfortable that phone-key compromise becomes full account compromise, use fingerprint-primary on either platform. See the comparison table in [Choosing a mode](#choosing-a-mode).
 
 ## Limitations
 
 This project does **not** protect against:
 
-- A fully compromised laptop OS — malware running with root can bypass PAM entirely, independent of anything this project does.
+- A fully compromised laptop OS — malware running with root/admin can bypass this entirely, independent of anything this project does.
 - A compromised or jailbroken phone with the private key physically extracted from its secure enclave via a hardware exploit.
+- (Fingerprint-primary mode, either platform) a stolen or cloned phone key on its own — that's the explicit tradeoff of the mode, see [Choosing a mode](#choosing-a-mode).
+- (Windows) an unsigned DLL being flagged or blocked by SmartScreen/Defender in stricter environments — signing it yourself is on you for now.
 
-Use full-disk encryption (LUKS / FileVault) and keep your phone's OS updated regardless of whether you use this project — those are the layers that address the risks above.
+Use full-disk encryption (LUKS / BitLocker / FileVault) and keep your phone's OS updated regardless of whether you use this project — those are the layers that address the risks above.
 
 ## License
 
