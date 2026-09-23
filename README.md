@@ -30,6 +30,7 @@ If you want a guarantee that a password is always checked no matter what, stay o
   7. [Test before you rely on it](#7-test-before-you-rely-on-it)
 - [Windows setup guide](#windows-setup-guide)
 - [Mobile app setup](#mobile-app-setup)
+- [Remote shutdown (security feature)](#remote-shutdown-security-feature)
 - [Re-pairing and revocation](#re-pairing-and-revocation)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
@@ -395,6 +396,99 @@ Scan the QR code with the Expo Go app (iOS or Android) to run it on your phone. 
 
 A hand-rolled "pin this cert" check in app code is easy to write in a way that looks correct but silently verifies nothing — React Native's WebSocket doesn't expose per-connection certificate inspection without a native module. Installing the laptop's own CA as a trusted certificate on the phone sidesteps that entirely: it's the same mechanism your phone already uses to trust ordinary `https://` sites, just pointed at a CA you control instead of a public one. This has been verified end-to-end in testing: a real TLS handshake against the generated CA succeeds, and anything not signed by it is rejected.
 
+## Remote shutdown (security feature)
+
+Alongside "Unlock my laptop," the app has a second button: **"Shut down
+laptop."** The idea: if you get a phone prompt for an unlock attempt you
+didn't make — someone else at your laptop trying to get in — you can shut
+the laptop down cold instead of approving it, rather than just declining
+and leaving it sitting there for another attempt.
+
+### How it's secured
+
+This is **not** a shortcut around the unlock flow's protections — it goes
+through the exact same pipeline, with one addition:
+
+- Same connection, same TLS/CA validation, same laptop-identity check.
+- Same nonce (single-use, 10s TTL), same rate limiting, same fail-closed
+  verification.
+- Same biometric gate — a fresh Face ID/fingerprint prompt is required,
+  separate from whatever unlocked your phone itself.
+- **Domain-separated signing**: the phone doesn't just send an "unlock"
+  or "shutdown" label alongside a generic signature — the action itself
+  is baked into what gets signed (`action:nonce:timestamp`). This means
+  a captured unlock signature can never be replayed or reinterpreted as
+  a shutdown command, and vice versa, even though both use the same key.
+  Verified directly in testing: an unlock-signed message fails
+  verification when checked against `action="shutdown"`, and a
+  shutdown-signed message fails when checked against `action="unlock"`.
+- **App-level confirmation before anything happens.** Tapping the button
+  shows a native confirm dialog ("This immediately powers off your
+  laptop... cannot be undone remotely") before the app even opens a
+  connection — the biometric prompt is a second, independent gate after
+  that.
+- **Off by default.** `pair.py` / `pair_windows.py` ask explicitly during
+  setup ("Enable remote shutdown? [y/N]"). If you said no, or are
+  upgrading an existing install, the listener will reject any shutdown
+  request outright — the config key `"shutdown_enabled"` has to be `true`.
+- Shutdown never touches PAM (Linux) or the Credential Provider (Windows)
+  — it's a fully separate code path from the login flow, so a bug in one
+  can't affect the other.
+
+### Enabling it later
+
+If you said "no" during pairing and want to turn it on:
+```bash
+nano ~/.config/remote-unlock/pairing.json   # Linux/macOS
+```
+or
+```
+notepad %LOCALAPPDATA%\remote-unlock\pairing.json   # Windows
+```
+Set `"shutdown_enabled": true`, save, and restart the listener service.
+
+### Linux: permission to power off without sudo
+
+Most desktop distros (GNOME, KDE, etc.) grant an active local session
+permission to power off via polkit (`org.freedesktop.login1.power-off`)
+without needing a password — `systemctl poweroff` should just work as
+your normal user. If it prompts for a password instead, either:
+
+- Adjust polkit rules to allow your user this specific action, or
+- Add a narrowly-scoped sudoers entry (more common on minimal/server
+  installs):
+  ```
+  # /etc/sudoers.d/remote-unlock  (edit with `sudo visudo -f ...`)
+  youruser ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
+  ```
+  and change `"shutdown_command"` in `pairing.json` to
+  `["sudo", "systemctl", "poweroff"]`.
+
+Scope any sudoers entry to exactly this one command — never grant broader
+`NOPASSWD` access for the sake of this feature.
+
+### Windows
+
+Default command is `shutdown /s /t 0`. A normal user account can run this
+without elevation by default; if your system has been locked down
+further, you may need an equivalent scoped permission grant.
+
+### Testing it
+
+Same principle as testing unlock (see above) — confirm both paths before
+relying on it:
+1. With the listener running and `shutdown_enabled: true`, tap "Shut down
+   laptop," confirm the dialog, then complete the biometric prompt.
+   Confirm the laptop actually powers off and you get a "Laptop Shutting
+   Down" push alert.
+2. Separately, confirm the *rejection* path: with `shutdown_enabled:
+   false` (or before you've enabled it), tap the button and confirm the
+   app reports the laptop rejected it — not a silent no-op that looks
+   like success.
+3. Cancel the confirmation dialog and the biometric prompt separately at
+   least once each, to confirm neither one alone is enough to trigger a
+   shutdown.
+
 ## Re-pairing and revocation
 
 **Linux:** if you lose the phone, suspect the passphrase leaked, or just want to rotate keys:
@@ -459,3 +553,9 @@ Use full-disk encryption (LUKS / BitLocker / FileVault) and keep your phone's OS
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Contact
+ - Email: nnair7598@gmail.com
+ - LinkedIn: https://www.linkedin.com/in/nikhil-nair-809248286/
+
+## Thank You
