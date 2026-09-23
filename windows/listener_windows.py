@@ -113,7 +113,7 @@ class UnlockService:
         self._pending_nonces = {
             n: t for n, t in self._pending_nonces.items() if now - t < NONCE_TTL
         }
-        message = f"{nonce}:{now}".encode()
+        message = f"challenge:{nonce}:{now}".encode()
         signature = self.laptop_private_key.sign(message, ec.ECDSA(hashes.SHA256()))
         return {"nonce": nonce, "timestamp": now, "signature": signature.hex()}
 
@@ -126,8 +126,12 @@ class UnlockService:
     def _record_failure(self):
         self._fail_times.append(time.time())
 
-    def verify(self, nonce: str, timestamp: float, signature_hex: str) -> bool:
+    def verify(self, nonce: str, timestamp: float, signature_hex: str, action: str = "unlock") -> bool:
         try:
+            if action not in ("unlock", "shutdown"):
+                log.warning("Unknown action %r — rejecting", action)
+                self._record_failure()
+                return False
             if self._rate_limited():
                 log.warning("Rate limit active — rejecting attempt")
                 return False
@@ -149,7 +153,7 @@ class UnlockService:
                 log.warning("Timestamp outside acceptable skew")
                 self._record_failure()
                 return False
-            message = f"{nonce}:{timestamp}".encode()
+            message = f"{action}:{nonce}:{timestamp}".encode()
             signature = bytes.fromhex(signature_hex)
             self.phone_public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
             self._used_nonces.add(nonce)
@@ -195,15 +199,30 @@ def signal_credential_provider(success: bool, windows_password: str | None):
         log.warning("Credential Provider isn't listening (no active login prompt): %s", e)
 
 
-def send_alert(success: bool, ntfy_topic: str):
+def send_alert(kind: str, ntfy_topic: str):
     try:
         import notify
-        notify.send_unlock_alert(success, ntfy_topic)
+        notify.send_alert(kind, ntfy_topic)
     except Exception as e:
         log.warning("Notification failed (non-fatal): %s", e)
 
 
-async def handler(websocket, service: UnlockService, windows_password: str):
+def trigger_shutdown(shutdown_command: list):
+    """Only ever called after UnlockService.verify() returns True for
+    action="shutdown" — a fresh, single-use, rate-limited, biometric-gated
+    signature from the paired phone. Default command is `shutdown /s /t 0`."""
+    import subprocess
+    try:
+        log.warning("Executing remote shutdown command: %s", shutdown_command)
+        subprocess.run(shutdown_command, check=True, timeout=10)
+    except Exception as e:
+        log.error("Shutdown command failed: %s", e)
+
+
+async def handler(
+    websocket, service: UnlockService, windows_password: str,
+    shutdown_enabled: bool, shutdown_command: list,
+):
     peer = websocket.remote_address
     try:
         challenge = service.issue_challenge()
@@ -213,15 +232,41 @@ async def handler(websocket, service: UnlockService, windows_password: str):
         if msg.get("type") != "response":
             await websocket.send(json.dumps({"type": "result", "ok": False}))
             return
+
+        action = msg.get("action", "unlock")
+        if action not in ("unlock", "shutdown"):
+            await websocket.send(json.dumps({"type": "result", "ok": False}))
+            log.warning("Rejected request from %s: unknown action %r", peer, action)
+            return
+
+        if action == "shutdown" and not shutdown_enabled:
+            await websocket.send(json.dumps({"type": "result", "ok": False}))
+            log.warning("Rejected shutdown request from %s: feature disabled", peer)
+            send_alert("shutdown_rejected", service.ntfy_topic)
+            return
+
         ok = service.verify(
             nonce=msg["nonce"],
             timestamp=float(msg["timestamp"]),
             signature_hex=msg["signature"],
+            action=action,
         )
         await websocket.send(json.dumps({"type": "result", "ok": ok}))
-        log.info("Unlock attempt from %s: %s", peer, "SUCCESS" if ok else "REJECTED")
-        signal_credential_provider(ok, windows_password if ok else None)
-        send_alert(ok, service.ntfy_topic)
+        log.info("%s attempt from %s: %s", action.upper(), peer, "SUCCESS" if ok else "REJECTED")
+
+        if action == "unlock":
+            signal_credential_provider(ok, windows_password if ok else None)
+            send_alert("unlock_success" if ok else "unlock_failed", service.ntfy_topic)
+        elif action == "shutdown":
+            # Deliberately does not touch signal_credential_provider at
+            # all — shutdown never interacts with the login/credential
+            # flow, it's a fully separate verified action.
+            if ok:
+                trigger_shutdown(shutdown_command)
+                send_alert("shutdown_triggered", service.ntfy_topic)
+            else:
+                send_alert("shutdown_rejected", service.ntfy_topic)
+
     except (asyncio.TimeoutError, KeyError, json.JSONDecodeError, ValueError) as e:
         log.warning("Malformed/late request from %s: %s", peer, e)
         signal_credential_provider(False, None)
@@ -261,8 +306,15 @@ async def main():
     service = UnlockService(config, laptop_private_key_pem)
     ssl_context = build_ssl_context(config)
 
+    shutdown_enabled = bool(config.get("shutdown_enabled", False))
+    shutdown_command = config.get("shutdown_command", ["shutdown", "/s", "/t", "0"])
+    if shutdown_enabled:
+        log.info("Remote shutdown is ENABLED (command: %s)", shutdown_command)
+    else:
+        log.info("Remote shutdown is disabled (see README.md to enable)")
+
     async def _handler(ws):
-        await handler(ws, service, windows_password)
+        await handler(ws, service, windows_password, shutdown_enabled, shutdown_command)
 
     bind_ip = config.get("listener_ip", "0.0.0.0")
     try:
