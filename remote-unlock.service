@@ -1,0 +1,38 @@
+# /etc/systemd/system/remote-unlock.service      (NOT tested on a live systemd host)
+[Unit]
+Description=Remote unlock listener
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=remote-unlock
+Group=remote-unlock
+Environment=REMOTE_UNLOCK_HOME=/etc/remote-unlock
+Environment=REMOTE_UNLOCK_STATE=/var/lib/remote-unlock
+RuntimeDirectory=remote-unlock
+RuntimeDirectoryMode=0700
+StateDirectory=remote-unlock
+StateDirectoryMode=0700
+# Passphrase never touches disk in plaintext:
+#   printf '%s' 'your passphrase' | sudo systemd-creds encrypt --name=passphrase - /etc/remote-unlock/passphrase.cred
+LoadCredentialEncrypted=passphrase:/etc/remote-unlock/passphrase.cred
+ExecStart=/usr/bin/python3 /opt/remote-unlock/listener.py
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+CapabilityBoundingSet=
+ReadOnlyPaths=/etc/remote-unlock
+
+[Install]
+WantedBy=multi-user.target
