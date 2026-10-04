@@ -1,72 +1,64 @@
 #!/usr/bin/env python3
 """
-pam_unlock_helper.py — invoked by pam_exec.so during login/unlock.
+pam_unlock_helper.py - called by pam_exec.so (as root) during login/unlock.
 
-Contract with PAM:
-  - Exit code 0  -> pam_exec reports success -> (combined with `expose_authtok`
-                     or a following pam_permit, this can satisfy auth)
-  - Exit code != 0 -> pam_exec reports failure -> normal password prompt still
-                     applies (this is an ADDITIONAL factor, not a replacement
-                     for your password, unless you explicitly configure PAM
-                     with `sufficient` — see README's security warning)
+v1 listened on a socket that ANY process of the same user could write "1" to.
+v2 inverts the trust: this helper connects OUT to the listener's root-only
+socket and asks "has a verified unlock grant been issued for this user?".
 
-Behavior:
-  - Opens a Unix domain socket in /run (tmpfs, RAM-backed, wiped on reboot).
-  - Waits up to WAIT_TIMEOUT seconds for listener.py to signal a result.
-  - ANY failure mode (timeout, malformed signal, socket error) exits 1.
-    This script never assumes success; it only ever reports success when
-    an explicit, verified "1" byte arrives from the listener.
-  - Deletes its own socket file on exit so no stale file is left in /run.
-    This is the only filesystem cleanup this script performs, and it's
-    tmpfs (memory), not persistent disk.
+  * The helper checks (SO_PEERCRED) that the socket is really served by the
+    configured service user, so a planted fake socket cannot say "yes".
+  * The listener checks the helper's uid (default: root only) and the user name.
+  * The grant is single-use and short-lived, and lives only in listener memory.
+  * Every error, timeout or odd reply => exit 1 (deny).
+
+Install it root-owned and not writable by anyone else:
+    sudo install -o root -g root -m 0755 pam_unlock_helper.py common.py \
+         /usr/local/lib/remote-unlock/
 """
-
+import json
 import os
+import pwd
 import socket
+import struct
 import sys
-import time
-
-WAIT_TIMEOUT = 15  # seconds to wait for a phone-unlock signal
-SOCK_PATH = f"/run/user/{os.getuid()}/remote-unlock-signal.sock"
+from pathlib import Path
 
 
-def wait_for_signal() -> bool:
-    # Clean up any stale socket from a previous run before binding.
+def request_unlock(sock_path: str, user: str, expected_uid: int, timeout: float) -> bool:
     try:
-        os.unlink(SOCK_PATH)
-    except FileNotFoundError:
-        pass
-
-    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
-        s.bind(SOCK_PATH)
-        os.chmod(SOCK_PATH, 0o600)
-        s.settimeout(WAIT_TIMEOUT)
-        try:
-            data, _ = s.recvfrom(1)
-        except socket.timeout:
-            return False
-        finally:
-            try:
-                os.unlink(SOCK_PATH)
-            except FileNotFoundError:
-                pass
-
-    return data == b"1"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(sock_path)
+            _pid, peer_uid, _gid = struct.unpack("3i", s.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            if peer_uid != expected_uid:
+                return False  # not the real listener
+            s.sendall((json.dumps({"user": user}) + "\n").encode())
+            reply = b""
+            while not reply.endswith(b"\n") and len(reply) < 8:
+                chunk = s.recv(8)
+                if not chunk:
+                    break
+                reply += chunk
+            return reply == b"1\n"
+    except Exception:  # noqa: BLE001 - fail closed
+        return False
 
 
 def main() -> int:
-    start = time.time()
-    success = wait_for_signal()
-    elapsed = time.time() - start
-
-    # Extra safety: never accept a "success" that arrived suspiciously fast
-    # (faster than a real network round-trip + biometric prompt could be),
-    # since that would suggest something local is spoofing the socket
-    # rather than the listener relaying a genuine phone response.
-    if success and elapsed < 0.05:
+    user = os.environ.get("PAM_USER", "")
+    home = Path(os.environ.get("REMOTE_UNLOCK_HOME", "/etc/remote-unlock"))
+    try:
+        cfg = json.loads((home / "config.json").read_text())
+        sock_path = cfg.get("pam_socket", "/run/remote-unlock/pam.sock")
+        expected_uid = pwd.getpwnam(cfg.get("service_user", "remote-unlock")).pw_uid
+        wait = float(cfg.get("pam_wait", 15)) + 3
+    except Exception:  # noqa: BLE001
         return 1
-
-    return 0 if success else 1
+    if os.getuid() != 0 or not user:
+        return 1
+    return 0 if request_unlock(sock_path, user, expected_uid, wait) else 1
 
 
 if __name__ == "__main__":
