@@ -1,315 +1,271 @@
 #!/usr/bin/env python3
 """
-pair.py — one-time pairing between this laptop and your phone.
+pair.py - one-time setup and device management for remote-unlock v2.
 
-What it does:
-  1. Generates an ECDSA (P-256) keypair for the LAPTOP.
-  2. Prints the laptop's public key as text (and optionally a QR code) so you
-     can enter it into the phone app.
-  3. Prompts you to paste in the PHONE's public key (printed by the phone app
-     during its own pairing screen).
-  4. Saves both keys to one small JSON config file.
+  init            create private CA, server TLS cert, laptop signing key, config
+  add-device      register a phone: pin its signing key, issue its mTLS client cert
+  list-devices    show registered devices
+  revoke-device   disable a device (takes effect immediately, no restart)
+  renew-server    re-issue the server TLS cert (e.g. after an IP change)
 
-File-system contact is intentionally minimal and explicit:
-  - Writes exactly one file: ~/.config/remote-unlock/pairing.json
-  - Never touches any other path, never runs with elevated privileges,
-    never modifies system files. (PAM registration is a separate, manual
-    step documented in README.md — this script does not touch PAM at all.)
-
-Run this once, from an interactive shell, as your normal user (not root).
+Files are written to $REMOTE_UNLOCK_HOME (default ~/.config/remote-unlock),
+directory 0700, files 0600. All private keys are encrypted (PKCS#8, AES-256)
+with your passphrase. ca-key.pem is only needed by this tool - MOVE IT OFFLINE
+after setup (see README) so the running service can never mint certificates.
 """
-
-import base64
-import datetime
-import getpass
-import hashlib
+import argparse
+import datetime as dt
+import ipaddress
 import json
-import os
 import secrets
-import stat
+import socket
 import sys
 from pathlib import Path
 
 from cryptography import x509
-from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-CONFIG_DIR = Path.home() / ".config" / "remote-unlock"
-CONFIG_FILE = CONFIG_DIR / "pairing.json"
-CA_CERT_FILE = CONFIG_DIR / "ca-cert.pem"           # install this on the phone
-CA_KEY_ENCRYPTED_FILE = CONFIG_DIR / "ca-key.enc"   # only needed to reissue leaf certs
-LEAF_CERT_FILE = CONFIG_DIR / "laptop-cert.pem"
-LEAF_KEY_FILE = CONFIG_DIR / "laptop-key.pem"
+from common import (Config, DEFAULTS, ID_RE, get_passphrase, home_dir,
+                    load_public_key, public_pem, sha256_hex, write_private)
 
-# scrypt cost parameters — deliberately expensive, this only runs once per
-# listener startup, so slowness here is pure benefit against offline
-# passphrase-guessing if pairing.json is ever stolen.
-SCRYPT_N = 2**17
-SCRYPT_R = 8
-SCRYPT_P = 1
+MIN_PASSPHRASE = 12
 
 
-def derive_key(passphrase: str, salt: bytes) -> bytes:
-    kdf = Scrypt(salt=salt, length=32, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
-    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode()))
+# ----------------------------- crypto helpers -----------------------------
+def _gen_key():
+    return ec.generate_private_key(ec.SECP256R1())
 
 
-def encrypt_private_key(priv_pem: str, passphrase: str) -> dict:
-    salt = os.urandom(16)
-    key = derive_key(passphrase, salt)
-    token = Fernet(key).encrypt(priv_pem.encode())
-    return {"salt": base64.b64encode(salt).decode(), "ciphertext": token.decode()}
-
-
-def generate_ca():
-    """Self-signed root CA. This is what you install as a trusted
-    certificate on your phone, ONE TIME. After that, standard TLS
-    validation (no custom pinning code in the app) just works, because the
-    phone's OS trusts anything this CA signs — and only this CA signs
-    anything, because its private key never leaves your laptop.
-    """
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, "Remote Unlock Local CA"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "remote-unlock (self-signed, local only)"),
-    ])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow())
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=False, content_commitment=False,
-                key_encipherment=False, data_encipherment=False,
-                key_agreement=False, key_cert_sign=True, crl_sign=True,
-                encipher_only=False, decipher_only=False,
-            ),
-            critical=True,
-        )
-        .sign(key, hashes.SHA256())
-    )
-    return key, cert
-
-
-def generate_leaf(ca_key, ca_cert, laptop_ip: str):
-    """Leaf certificate for the listener itself, signed by the local CA
-    above. Only valid for the specific LAN IP you give it — if your
-    laptop's IP changes (no DHCP reservation set), re-run pair.py's
-    `--renew-cert` mode (see README) rather than re-pairing from scratch."""
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, laptop_ip)])
-    import ipaddress
-    san_entries = [x509.DNSName("laptop-unlock-local")]
-    try:
-        san_entries.append(x509.IPAddress(ipaddress.ip_address(laptop_ip)))
-    except ValueError:
-        san_entries = [x509.DNSName(laptop_ip)]  # treat as hostname instead
-
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(ca_cert.subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow())
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=397))  # keep leaf-lived short
-        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .sign(ca_key, hashes.SHA256())
-    )
-    key_pem = key.private_bytes(
+def _enc_pem(key, pw: str) -> bytes:
+    return key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
+        serialization.BestAvailableEncryption(pw.encode()),
     )
-    return key_pem, cert.public_bytes(serialization.Encoding.PEM)
 
 
-def generate_laptop_keypair():
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    public_key = private_key.public_key()
+def _cert_pem(c) -> bytes:
+    return c.public_bytes(serialization.Encoding.PEM)
 
-    priv_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode()
 
-    pub_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode()
+def _build_cert(cn, pub, issuer_cn, issuer_key, days, *, ca=False,
+                san_ip=None, san_dns=None, eku=None):
+    now = dt.datetime.now(dt.timezone.utc)
+    b = (x509.CertificateBuilder()
+         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+         .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_cn)]))
+         .public_key(pub)
+         .serial_number(x509.random_serial_number())
+         .not_valid_before(now - dt.timedelta(minutes=5))
+         .not_valid_after(now + dt.timedelta(days=days))
+         .add_extension(x509.SubjectKeyIdentifier.from_public_key(pub), False)
+         .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+             issuer_key.public_key()), False))
+    ku = dict(digital_signature=not ca, content_commitment=False, key_encipherment=False,
+              data_encipherment=False, key_agreement=False, key_cert_sign=ca,
+              crl_sign=ca, encipher_only=False, decipher_only=False)
+    b = b.add_extension(x509.BasicConstraints(ca=ca, path_length=0 if ca else None), True)
+    b = b.add_extension(x509.KeyUsage(**ku), True)
+    if eku:
+        b = b.add_extension(x509.ExtendedKeyUsage([eku]), False)
+    sans = []
+    if san_ip:
+        sans.append(x509.IPAddress(ipaddress.ip_address(san_ip)))
+    if san_dns:
+        sans.append(x509.DNSName(san_dns))
+    if sans:
+        b = b.add_extension(x509.SubjectAlternativeName(sans), False)
+    return b.sign(issuer_key, hashes.SHA256())
 
-    return priv_pem, pub_pem
+
+def _load_key(path: Path, pw: str):
+    return serialization.load_pem_private_key(path.read_bytes(), password=pw.encode())
+
+
+def _issue_server(cfg_dir: Path, ca_key, ca_cert, target_id, ip, pw):
+    key = _gen_key()
+    cert = _build_cert(target_id, key.public_key(), ca_cert.subject.rfc4514_string()[3:],
+                       ca_key, 365, san_ip=ip, san_dns=target_id,
+                       eku=ExtendedKeyUsageOID.SERVER_AUTH)
+    write_private(cfg_dir / "server-key.pem", _enc_pem(key, pw))
+    write_private(cfg_dir / "server-cert.pem", _cert_pem(cert))
+
+
+# ------------------------------- commands ---------------------------------
+def init(cfg_dir: Path, *, ip: str, port: int, target_id: str, unlock_user: str,
+         passphrase: str, force=False) -> Config:
+    if len(passphrase) < MIN_PASSPHRASE:
+        raise SystemExit(f"Passphrase must be at least {MIN_PASSPHRASE} characters.")
+    if not ID_RE.match(target_id):
+        raise SystemExit("target-id must match [a-z0-9][a-z0-9-]* (max 63 chars)")
+    ipaddress.ip_address(ip)
+    if ip in ("0.0.0.0", "::"):
+        raise SystemExit("Give the specific Tailscale/WireGuard/LAN IP, not a wildcard.")
+    cfg_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cfg_dir.chmod(0o700)
+    cfg_path = cfg_dir / "config.json"
+    if cfg_path.exists() and not force:
+        raise SystemExit(f"{cfg_path} exists. Use --force to overwrite (this revokes everything).")
+
+    # Private CA
+    ca_key = _gen_key()
+    ca_cert = _build_cert("remote-unlock-ca", ca_key.public_key(), "remote-unlock-ca",
+                          ca_key, 3650, ca=True)
+    write_private(cfg_dir / "ca-key.pem", _enc_pem(ca_key, passphrase))
+    write_private(cfg_dir / "ca-cert.pem", _cert_pem(ca_cert))
+
+    # Server TLS identity
+    _issue_server(cfg_dir, ca_key, ca_cert, target_id, ip, passphrase)
+
+    # Laptop application-layer signing key (second, independent identity check)
+    sign_key = _gen_key()
+    write_private(cfg_dir / "laptop-signing-key.pem", _enc_pem(sign_key, passphrase))
+
+    data = json.loads(json.dumps(DEFAULTS))
+    data.update({
+        "target_id": target_id,
+        "listener_ip": ip,
+        "listener_port": port,
+        "unlock_user": unlock_user,
+        "laptop_public_key_pem": public_pem(sign_key.public_key()),
+        "tls": {"ca_cert": "ca-cert.pem", "server_cert": "server-cert.pem",
+                "server_key": "server-key.pem"},
+        "signing_key": "laptop-signing-key.pem",
+        "alerts": {"ntfy": {"server": "https://ntfy.sh",
+                            "topic": "ru-" + secrets.token_urlsafe(24), "token": None}},
+    })
+    write_private(cfg_path, json.dumps(data, indent=2).encode())
+    return Config(cfg_path)
+
+
+def add_device(cfg_dir: Path, *, name: str, phone_pubkey: str, passphrase: str,
+               days: int = 365) -> dict:
+    """Register a device. Returns {'p12': bytes, 'p12_password': str,
+    'cert_pem': bytes, 'key_pem': bytes}."""
+    if not ID_RE.match(name):
+        raise SystemExit("device name must match [a-z0-9][a-z0-9-]*")
+    cfg = Config(cfg_dir / "config.json")
+    if any(d["id"] == name for d in cfg["devices"]):
+        raise SystemExit(f"device '{name}' already exists (revoke it first to re-issue)")
+    load_public_key(phone_pubkey)  # validates P-256
+
+    ca_key = _load_key(cfg_dir / "ca-key.pem", passphrase)
+    ca_cert = x509.load_pem_x509_certificate((cfg_dir / "ca-cert.pem").read_bytes())
+    key = _gen_key()
+    cert = _build_cert(name, key.public_key(), "remote-unlock-ca", ca_key, days,
+                       eku=ExtendedKeyUsageOID.CLIENT_AUTH)
+
+    p12_password = secrets.token_urlsafe(12)
+    p12 = pkcs12.serialize_key_and_certificates(
+        name.encode(), key, cert, [ca_cert],
+        serialization.BestAvailableEncryption(p12_password.encode()))
+
+    cfg.data["devices"].append({
+        "id": name,
+        "public_key_pem": public_pem(load_public_key(phone_pubkey)),
+        "cert_sha256": sha256_hex(cert.public_bytes(serialization.Encoding.DER)),
+        "enabled": True,
+        "created": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "cert_expires": cert.not_valid_after_utc.isoformat(timespec="seconds"),
+    })
+    cfg.save()
+    return {"p12": p12, "p12_password": p12_password, "cert_pem": _cert_pem(cert),
+            "key_pem": key.private_bytes(serialization.Encoding.PEM,
+                                         serialization.PrivateFormat.PKCS8,
+                                         serialization.NoEncryption())}
+
+
+def revoke_device(cfg_dir: Path, name: str):
+    cfg = Config(cfg_dir / "config.json")
+    for d in cfg["devices"]:
+        if d["id"] == name:
+            d["enabled"] = False
+            d["revoked"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+            cfg.save()
+            return
+    raise SystemExit(f"no such device: {name}")
+
+
+def renew_server(cfg_dir: Path, *, ip: str | None, passphrase: str):
+    cfg = Config(cfg_dir / "config.json")
+    ca_key = _load_key(cfg_dir / "ca-key.pem", passphrase)
+    ca_cert = x509.load_pem_x509_certificate((cfg_dir / "ca-cert.pem").read_bytes())
+    ip = ip or cfg["listener_ip"]
+    _issue_server(cfg_dir, ca_key, ca_cert, cfg["target_id"], ip, passphrase)
+    cfg.data["listener_ip"] = ip
+    cfg.save()
+
+
+# --------------------------------- CLI ------------------------------------
+def _safe_hostname():
+    h = "".join(c if c.isalnum() else "-" for c in socket.gethostname().lower()).strip("-")
+    return (h or "laptop")[:40]
 
 
 def main():
-    if CONFIG_FILE.exists():
-        answer = input(
-            f"{CONFIG_FILE} already exists. Overwrite and re-pair? [y/N] "
-        )
-        if answer.strip().lower() != "y":
-            print("Aborted. Existing pairing left untouched.")
-            sys.exit(0)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
 
-    print("Generating laptop keypair (ECDSA P-256)...")
-    laptop_priv_pem, laptop_pub_pem = generate_laptop_keypair()
+    p = sub.add_parser("init")
+    p.add_argument("--ip", required=True, help="Tailscale/WireGuard/LAN IP to bind to")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--target-id", default=_safe_hostname())
+    p.add_argument("--unlock-user", required=True, help="local account PAM may unlock")
+    p.add_argument("--force", action="store_true")
 
-    print("\n=== Laptop PUBLIC key (enter this into the phone app) ===\n")
-    print(laptop_pub_pem)
+    p = sub.add_parser("add-device")
+    p.add_argument("name")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pubkey-file", help="file with the phone's P-256 public key (PEM or base64 DER)")
+    g.add_argument("--pubkey", help="phone's public key, inline")
+    p.add_argument("--out", default=".", help="directory for the .p12 bundle")
 
-    try:
-        import qrcode  # optional, only used if installed
+    sub.add_parser("list-devices")
+    p = sub.add_parser("revoke-device")
+    p.add_argument("name")
+    p = sub.add_parser("renew-server")
+    p.add_argument("--ip")
 
-        qr = qrcode.QRCode(border=1)
-        qr.add_data(laptop_pub_pem)
-        qr.make()
-        qr.print_ascii(invert=True)
-    except ImportError:
-        pass  # QR code is a convenience only; plain text works fine
+    a = ap.parse_args()
+    d = home_dir()
 
-    print("Now open the pairing screen on your phone app.")
-    print("Paste the phone's PUBLIC key below, then press Enter twice.\n")
-
-    lines = []
-    while True:
-        line = input()
-        if line.strip() == "" and lines:
-            break
-        lines.append(line)
-    phone_pub_pem = "\n".join(lines).strip() + "\n"
-
-    if "BEGIN PUBLIC KEY" not in phone_pub_pem:
-        print("That doesn't look like a PEM public key. Aborting, nothing saved.")
-        sys.exit(1)
-
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(CONFIG_DIR, stat.S_IRWXU)  # 0700 — owner only
-
-    # --- Encrypt the unlock private key with a passphrase -----------------
-    # This is the single most valuable key in the whole system: whoever has
-    # it can remotely unlock the laptop. Plaintext-on-disk storage means
-    # any local file read (another user, malware, a stolen unencrypted
-    # backup) is a full compromise. Encrypting it means an attacker needs
-    # BOTH file access AND the passphrase.
-    print("\nChoose a passphrase to encrypt the unlock key at rest.")
-    print("You'll be asked for this once, whenever the listener service starts")
-    print("(not on every unlock attempt).")
-    while True:
-        passphrase = getpass.getpass("Passphrase: ")
-        confirm = getpass.getpass("Confirm: ")
-        if passphrase != confirm:
-            print("Didn't match, try again.")
-            continue
-        if len(passphrase) < 12:
-            print("Use at least 12 characters.")
-            continue
-        break
-
-    encrypted_priv = encrypt_private_key(laptop_priv_pem, passphrase)
-
-    # --- Local CA + leaf certificate, generated automatically -------------
-    print("\nWhat IP should the certificate be issued for?")
-    print("  - If you've set up Tailscale (recommended for cross-network use),")
-    print("    enter the laptop's Tailscale IP: run `tailscale ip -4` on the")
-    print("    laptop to get it (looks like 100.x.x.x).")
-    print("  - Otherwise, enter the laptop's LAN IP (e.g. 192.168.1.42) — this")
-    print("    will only work while phone and laptop share the same Wi-Fi.")
-    print("Tip: a Tailscale IP is stable and doesn't need a DHCP reservation.")
-    print("For a plain LAN IP, set a static DHCP reservation on your router so")
-    print("it doesn't change later and break the cert.")
-    laptop_ip = input("Laptop IP (Tailscale or LAN): ").strip()
-
-    ca_key, ca_cert = generate_ca()
-    leaf_key_pem, leaf_cert_pem = generate_leaf(ca_key, ca_cert, laptop_ip)
-
-    ca_key_pem = ca_key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    ).decode()
-    ca_cert_pem = ca_cert.public_bytes(serialization.Encoding.PEM)
-
-    # CA private key is encrypted too: it's the root of trust for the TLS
-    # layer. It's not needed at listener startup (only the leaf key is), so
-    # keeping it encrypted-at-rest costs nothing day-to-day and only
-    # matters if you later reissue a leaf cert (e.g. IP change).
-    encrypted_ca_key = encrypt_private_key(ca_key_pem, passphrase)
-    CA_KEY_ENCRYPTED_FILE.write_text(json.dumps(encrypted_ca_key))
-    os.chmod(CA_KEY_ENCRYPTED_FILE, stat.S_IRUSR | stat.S_IWUSR)
-
-    CA_CERT_FILE.write_bytes(ca_cert_pem)              # not secret — install on phone
-    LEAF_CERT_FILE.write_bytes(leaf_cert_pem)
-    LEAF_KEY_FILE.write_bytes(leaf_key_pem)
-    os.chmod(LEAF_KEY_FILE, stat.S_IRUSR | stat.S_IWUSR)
-    os.chmod(LEAF_CERT_FILE, stat.S_IRUSR | stat.S_IWUSR)
-
-    ntfy_topic = "unlock-" + secrets.token_urlsafe(24)
-
-    # --- Remote shutdown, opt-in ------------------------------------------
-    print("\nEnable remote shutdown from the phone?")
-    print("This adds a second button in the app: if you see an unlock")
-    print("attempt you didn't make, you can shut the laptop down instead of")
-    print("approving it. It uses the SAME signature/nonce/rate-limit")
-    print("protections as unlock — a biometric-gated, single-use, signed")
-    print("command — but it's a destructive, irreversible action, so it's")
-    print("off by default. You can change this later by editing")
-    print(f"  {CONFIG_FILE}")
-    print("and setting \"shutdown_enabled\" to true/false directly.")
-    shutdown_answer = input("Enable remote shutdown? [y/N] ").strip().lower()
-    shutdown_enabled = shutdown_answer == "y"
-
-    config = {
-        "laptop_private_key_encrypted": encrypted_priv,
-        "laptop_public_key_pem": laptop_pub_pem,
-        "phone_public_key_pem": phone_pub_pem,
-        "listener_port": 8765,
-        "listener_ip": laptop_ip,
-        "tls_cert_path": str(LEAF_CERT_FILE),
-        "tls_key_path": str(LEAF_KEY_FILE),
-        "ntfy_topic": ntfy_topic,
-        "shutdown_enabled": shutdown_enabled,
-        "shutdown_command": ["systemctl", "poweroff"],
-    }
-
-    CONFIG_FILE.write_text(json.dumps(config, indent=2))
-    os.chmod(CONFIG_FILE, stat.S_IRUSR | stat.S_IWUSR)  # 0600 — owner only
-
-    print(f"\nPaired. Config written to {CONFIG_FILE} (permissions 600).")
-    print(f"\n=== Install this root certificate on your phone (one time) ===")
-    print(f"File: {CA_CERT_FILE}")
-    print("Airdrop/email/transfer it to your phone, then:")
-    print("  iOS: open the file -> Settings > General > VPN & Device Management")
-    print("       > install the profile, THEN also go to Settings > General >")
-    print("       About > Certificate Trust Settings and enable full trust for it.")
-    print("  Android: Settings > Security > Encryption & credentials > Install a")
-    print("       certificate > CA certificate, then select the file.")
-    print("This is NOT secret — it's a public certificate, like any root CA.")
-    print("Its private key stays encrypted on this laptop and is never shared.")
-    print(f"\n=== ntfy.sh topic (treat as secret) ===")
-    print(ntfy_topic)
-    print(f"Subscribe to it in the ntfy app so you receive unlock alerts.")
-    if shutdown_enabled:
-        print("\n=== Remote shutdown: ENABLED ===")
-        print("Check that `systemctl poweroff` works without a password for your")
-        print("user (most desktop distros allow this via polkit for an active")
-        print("local session). If it prompts for a password, see README.md for")
-        print("the sudoers NOPASSWD fallback.")
-    else:
-        print("\nRemote shutdown: disabled (default). Enable later by editing")
-        print(f"  {CONFIG_FILE}")
-        print('  and setting "shutdown_enabled": true')
-    print("\nNext: follow README.md to enable the systemd service and wire up PAM.")
-    print("The listener will ask for your passphrase each time it starts.")
+    if a.cmd == "init":
+        pw = get_passphrase("Choose a passphrase (>=12 chars): ", confirm=True)
+        cfg = init(d, ip=a.ip, port=a.port, target_id=a.target_id,
+                   unlock_user=a.unlock_user, passphrase=pw, force=a.force)
+        print(f"\nCreated {d}\n")
+        print("Laptop public key (give to the phone app, pin it there):")
+        print(cfg["laptop_public_key_pem"])
+        print(f"target_id : {cfg['target_id']}")
+        print(f"CA cert   : {d / 'ca-cert.pem'}  (install/pin on the phone)")
+        print(f"ntfy topic: {cfg['alerts']['ntfy']['topic']}  (subscribe in the ntfy app)")
+        print(f"\nNEXT: python3 pair.py add-device <name> --pubkey-file phone.pub")
+        print(f"THEN: move {d / 'ca-key.pem'} to offline storage.")
+    elif a.cmd == "add-device":
+        pub = Path(a.pubkey_file).read_text() if a.pubkey_file else a.pubkey
+        pw = get_passphrase("Passphrase (to use the CA key): ")
+        r = add_device(d, name=a.name, phone_pubkey=pub, passphrase=pw)
+        out = Path(a.out) / f"{a.name}.p12"
+        write_private(out, r["p12"])
+        print(f"Registered '{a.name}'.\n  Client certificate bundle: {out}")
+        print(f"  Bundle password (shown ONCE): {r['p12_password']}")
+        print("  Transfer the .p12 to the phone over a trusted channel, import it, "
+              "then delete the file.")
+    elif a.cmd == "list-devices":
+        for dev in Config(d / "config.json")["devices"]:
+            state = "active" if dev.get("enabled", True) else f"REVOKED {dev.get('revoked', '')}"
+            print(f"{dev['id']:<20} {state:<10} cert-expires {dev.get('cert_expires', '?')}")
+    elif a.cmd == "revoke-device":
+        revoke_device(d, a.name)
+        print(f"Revoked {a.name}. Active immediately.")
+    elif a.cmd == "renew-server":
+        renew_server(d, ip=a.ip, passphrase=get_passphrase("Passphrase: "))
+        print("Server certificate re-issued. Restart the service.")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
